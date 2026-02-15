@@ -3,17 +3,16 @@ defaults:
   - measurements:
     - distance_to_goal
     - distance_to_goal_reward
-    - success 
-    - did_multi_agents_collide 
-    - num_steps 
+    - success
+    - did_multi_agents_collide
+    - num_steps
     - top_down_map
     - spl
     - psc
-    - stl
     - human_collision
     - human_velocity_measure # for orca
   - lab_sensors:
-    - localization_sensor 
+    - localization_sensor
     - oracle_shortest_path_sensor # for astar
     - human_velocity_sensor # for orca
   - _self_

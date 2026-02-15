@@ -26,20 +26,34 @@ from omegaconf import OmegaConf
 from hydra.core.config_search_path import ConfigSearchPath
 from hydra.plugins.search_path_plugin import SearchPathPlugin
 
+import sys
+import os
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+############################################################################################################
+from . import adapt3r_policy
+from . import adapt3r_config
+
+# 将Adapt3RConfig注册到habitat_baselines配置模块中以解决checkpoint加载问题
+import habitat_baselines.config.default_structured_configs as hb_configs
+hb_configs.Adapt3RConfig = adapt3r_config.Adapt3RConfig
+hb_configs.Adapt3RVisualEncoderConfig = adapt3r_config.Adapt3RVisualEncoderConfig
+
+############################################################################################################
+
+
 class HabitatConfigPlugin(SearchPathPlugin):
     def manipulate_search_path(self, search_path: ConfigSearchPath) -> None:
-        search_path.append(provider="evalai", path="input/")
-        search_path.append(provider="evalai", path="team1/")
-        search_path.append(provider="evalai", path="team2/")
-        search_path.append(provider="evalai", path="team3/")
-        search_path.append(provider="evalai", path="team4/")
-        search_path.append(provider="evalai", path="team5/")
+        search_path.append(provider="robosense", path="team4/")
 
 register_hydra_plugin(HabitatConfigPlugin)
 @hydra.main(
     version_base=None,
-    config_path="config",
-    config_name="pointnav/ppo_pointnav_example",
+    config_path=None,
+    config_name="falcon_hm3d_beginner",
 )
 
 def main(cfg: "DictConfig"):
@@ -65,16 +79,7 @@ def main(cfg: "DictConfig"):
     allowed_obs_keys = [
         "agent_0_articulated_agent_jaw_rgb",
         "agent_0_articulated_agent_jaw_depth",
-        "agent_0_pointgoal_with_gps_compass",
-        "agent_0_localization_sensor",
-        "agent_1_localization_sensor",
-        "agent_2_localization_sensor",
-        "agent_3_localization_sensor",
-        "agent_4_localization_sensor",
-        "agent_5_localization_sensor",
-        "agent_6_localization_sensor",
-        "agent_0_oracle_shortest_path_sensor",
-        "agent_0_human_velocity_sensor",
+        "agent_0_pointgoal_with_gps_compass"
     ]
     obs_keys = cfg.habitat.gym.obs_keys
     invalid_obs_keys = set(obs_keys) - set(allowed_obs_keys)
@@ -103,7 +108,6 @@ def main(cfg: "DictConfig"):
         "spl",
         "psc",
         "human_collision",
-        "human_velocity_measure",
     ]
     measurement_keys = list(cfg.habitat.task.measurements.keys())
     invalid_measurements = set(measurement_keys) - set(allowed_measurements)
