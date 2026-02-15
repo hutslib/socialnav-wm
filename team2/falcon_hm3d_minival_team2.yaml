@@ -87,12 +87,12 @@ habitat_baselines:
   verbose: True
   trainer_name: "ddppo"
   torch_gpu_id: 0
-  tensorboard_dir: "evaluation/falcon/hm3d/tb"
-  video_dir: "evaluation/falcon/hm3d/video"
+  tensorboard_dir: "evaluation/team2/hm3d/tb"
+  video_dir: "evaluation/team2/hm3d/video"
   test_episode_count: -1
   eval_ckpt_path_dir: "team2/pretrained_model/latest_eval.pth"
   num_environments: 8
-  checkpoint_folder: "evaluation/falcon/hm3d/checkpoints"
+  checkpoint_folder: "evaluation/team2/hm3d/checkpoints"
   num_updates: -1
   total_num_steps: 1e8
   log_interval: 10
@@ -109,7 +109,7 @@ habitat_baselines:
     split: minival
     use_ckpt_config: False
     should_load_ckpt: True
-    # video_option: ["disk"]
+    video_option: ["disk"]
 
   rl:
     agent:

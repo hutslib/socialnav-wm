@@ -56,10 +56,10 @@ def main(cfg: "DictConfig"):
             f"[ERROR] habitat.seed must be 100, but got {cfg.habitat.seed}"
         )
 
-    if len(cfg.habitat_baselines.eval.video_option) != 0:
-        raise ValueError(
-            f"[ERROR] habitat_baselines.eval.video_option must be [''], but got {cfg.habitat_baselines.eval.video_option}"
-        )
+    # if len(cfg.habitat_baselines.eval.video_option) != 0:
+    #     raise ValueError(
+    #         f"[ERROR] habitat_baselines.eval.video_option must be [''], but got {cfg.habitat_baselines.eval.video_option}"
+    #     )
 
     # ========== ② Strict validation of observation keys ==========
     allowed_obs_keys = [

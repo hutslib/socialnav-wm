@@ -119,7 +119,7 @@ habitat_baselines:
   eval:
     use_ckpt_config: False
     should_load_ckpt: False
-    # video_option: ["disk"]
+    video_option: ["disk"]
 
   rl:
     agent:

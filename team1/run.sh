@@ -11,4 +11,4 @@ conda activate falcon
 export PYTHONPATH=$(pwd)
 
 # 运行主脚本
-CUDA_VISIBLE_DEVICES=1 python -u -m habitat-baselines.habitat_baselines.eval --config-name=falcon_hm3d_minival_team1.yaml
+CUDA_VISIBLE_DEVICES=0 python -u -m habitat-baselines.habitat_baselines.eval --config-name=falcon_hm3d_minival_team1.yaml
