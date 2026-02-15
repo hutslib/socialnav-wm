@@ -1,0 +1,17 @@
+# @package _global_
+# 实验 3: wm depth (消融 no depth) (消融 - 移除 Depth Decoder)
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_03_no_depth/tb"
+  video_dir: "experiments/exp_03_no_depth/video"
+  checkpoint_folder: "experiments/exp_03_no_depth/checkpoints"
+
+  world_model:
+    depth_loss_scale: 0.0
+    traj_loss_scale: 1.0
+    reward_loss_scale: 1.0
+    kl_loss_scale: 0.1

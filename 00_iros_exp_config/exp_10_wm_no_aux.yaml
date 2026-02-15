@@ -1,0 +1,14 @@
+# @package _global_
+# 实验 10: wm no aux (完整 World Model，无辅助损失)
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_10_wm_no_aux/tb"
+  video_dir: "experiments/exp_10_wm_no_aux/video"
+  checkpoint_folder: "experiments/exp_10_wm_no_aux/checkpoints"
+
+  rl:
+    auxiliary_losses: {}  # 无辅助损失（schema 要求 Dict，不可用 null）

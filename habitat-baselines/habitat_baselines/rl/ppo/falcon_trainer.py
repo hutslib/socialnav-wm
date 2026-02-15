@@ -1178,7 +1178,11 @@ class FalconTrainer(BaseRLTrainer):
 
     @rank0_only
     def _training_log(
-        self, writer, losses: Dict[str, float], prev_time: int = 0
+        self,
+        writer,
+        losses: Dict[str, float],
+        prev_time: int = 0,
+        count_checkpoints: Optional[int] = None,
     ):
         deltas = {
             k: (
@@ -1264,13 +1268,14 @@ class FalconTrainer(BaseRLTrainer):
 
             # Calculate next checkpoint progress
             if self.config.habitat_baselines.num_checkpoints != -1:
-                checkpoint_interval_steps = (
-                    total_steps / self.config.habitat_baselines.num_checkpoints
-                )
-                next_checkpoint_num = int(
+                num_ckpts = self.config.habitat_baselines.num_checkpoints
+                checkpoint_interval_steps = total_steps / num_ckpts
+                next_segment_1based = int(
                     self.num_steps_done / checkpoint_interval_steps
                 ) + 1
-                next_checkpoint_steps = next_checkpoint_num * checkpoint_interval_steps
+                next_checkpoint_steps = (
+                    next_segment_1based * checkpoint_interval_steps
+                )
                 steps_to_next_ckpt = max(
                     int(next_checkpoint_steps - self.num_steps_done), 0
                 )
@@ -1279,8 +1284,14 @@ class FalconTrainer(BaseRLTrainer):
                     / checkpoint_interval_steps
                     * 100
                 )
+                # 显示实际将要保存的文件名 (count_checkpoints)，与 "Saved ckpt.X.pth" 一致
+                next_save_str = (
+                    f"Next save: ckpt.{count_checkpoints}.pth"
+                    if count_checkpoints is not None
+                    else f"Next segment: {next_segment_1based}/{num_ckpts}"
+                )
                 logger.info(
-                    f"Next checkpoint: ckpt.{next_checkpoint_num} | "
+                    f"{next_save_str} | "
                     f"Progress to next: {pct_to_next_ckpt:.1f}% "
                     f"({steps_to_next_ckpt} steps remaining)"
                 )
@@ -1486,7 +1497,10 @@ class FalconTrainer(BaseRLTrainer):
                     for key, value in wm_losses.items():
                         losses[f'wm_{key}'] = value
 
-                self._training_log(writer, losses, prev_time)
+                self._training_log(
+                    writer, losses, prev_time,
+                    count_checkpoints=count_checkpoints,
+                )
 
                 # checkpoint model（resume state 与 ckpt 同频保存）
                 if rank0_only() and self.should_checkpoint():

@@ -1,0 +1,21 @@
+# @package _global_
+# 实验 5: falcon encoder (使用 Falcon Encoder 替代 Dreamer)
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_05_falcon_encoder/tb"
+  video_dir: "experiments/exp_05_falcon_encoder/video"
+  checkpoint_folder: "experiments/exp_05_falcon_encoder/checkpoints"
+
+  world_model:
+    encoder_type: falcon
+    falcon_backbone: resnet50
+    falcon_baseplanes: 32
+    falcon_ngroups: 32
+    falcon_use_projection: True
+    falcon_target_dim: 512
+    falcon_pretrained_path: pretrained_model/pretrained_habitat3.pth
+    falcon_strict_load: False
