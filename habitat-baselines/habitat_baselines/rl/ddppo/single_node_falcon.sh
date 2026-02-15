@@ -7,7 +7,9 @@ export PYTHONPATH=$(pwd)/../../..:$PYTHONPATH
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export GLOG_minloglevel=2
 export MAGNUM_LOG=quiet
-export HYDRA_FULL_ERROR=1 
+export HYDRA_FULL_ERROR=1
+# 避免 /dev/shm 不足导致 NCCL 创建共享内存失败（如 Docker 默认 64MB）
+export NCCL_SHM_DISABLE=1
 # 设置每个GPU使用16个CPU核心
 # CPU_CORES_PER_GPU=1 # 16
 TOTAL_GPU=4
