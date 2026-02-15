@@ -128,17 +128,11 @@ class PPO(nn.Module, Updater):
 
     def _create_optimizer(self, lr, eps, aux_tasks=None):
         params = list(filter(lambda p: p.requires_grad, self.parameters()))
-        logger.info(
-            f"(No Aux) Main Number of params to train: {sum(param.numel() for param in params)}"
-        )
 
         if len(aux_tasks) > 0:
             for aux_t in aux_tasks:
                 params += list(filter(lambda p: p.requires_grad, aux_t.parameters()))
 
-        logger.info(
-            f"Total Number of params to train: {sum(param.numel() for param in params)}"
-        )
         if len(params) > 0:
             optim_cls = optim.Adam
             optim_kwargs = dict(

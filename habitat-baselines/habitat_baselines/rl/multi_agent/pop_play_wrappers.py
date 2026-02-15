@@ -45,6 +45,7 @@ class MultiAgentPolicyActionData(PolicyActionData):
     length_rnn_hidden_states: Optional[torch.Tensor] = None
     length_actions: Optional[torch.Tensor] = None
     length_take_actions: Optional[torch.Tensor] = None
+    length_wm_features: Optional[torch.Tensor] = None
     num_agents: Optional[int] = 1
 
     def _unpack(self, tensor_to_unpack, unpack_lengths=None):
@@ -77,6 +78,13 @@ class MultiAgentPolicyActionData(PolicyActionData):
             "action_log_probs": self._unpack(self.action_log_probs),
             "take_actions": self._unpack(
                 self.take_actions, self.length_take_actions
+            ),
+            "wm_features": (
+                None
+                if self.wm_features is None
+                else self._unpack(
+                    self.wm_features, self.length_wm_features
+                )
             ),
             # This is numpy array and must be split differently.
             "should_inserts": np.split(
@@ -233,6 +241,19 @@ class MultiPolicy(Policy):
         rnn_hidden_lengths = [
             ac.rnn_hidden_states.shape[-1] for ac in agent_actions
         ]
+        wm_feature_lengths = [
+            0 if ac.wm_features is None else ac.wm_features.shape[-1]
+            for ac in agent_actions
+        ]
+        merged_wm_features = (
+            None
+            if sum(wm_feature_lengths) == 0
+            else _maybe_cat(
+                lambda ac: ac.wm_features,
+                wm_feature_lengths,
+                torch.float32,
+            )
+        )
         return MultiAgentPolicyActionData(
             rnn_hidden_states=torch.cat(
                 [ac.rnn_hidden_states for ac in agent_actions], -1
@@ -272,6 +293,8 @@ class MultiPolicy(Policy):
             length_rnn_hidden_states=rnn_hidden_lengths,
             length_actions=action_dims,
             length_take_actions=length_take_actions,
+            wm_features=merged_wm_features,
+            length_wm_features=wm_feature_lengths,
             num_agents=n_agents,
         )
 
@@ -439,7 +462,7 @@ class MultiStorage(Storage):
             insert_d = {k: _maybe_chunk(v) for k, v in kwargs.items()}
         else:
             insert_d = {
-                k: list(v)
+                k: (None if v is None else list(v))
                 for k, v in kwargs["action_data"].unpack().items()
                 if k in kwargs
             }

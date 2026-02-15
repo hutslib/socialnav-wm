@@ -16,6 +16,8 @@ from habitat.config.default_structured_configs import register_hydra_plugin
 from habitat_baselines.config.default_structured_configs import (
     HabitatBaselinesConfigPlugin,
 )
+from hydra.core.config_search_path import ConfigSearchPath
+from hydra.plugins.search_path_plugin import SearchPathPlugin
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -23,6 +25,12 @@ if TYPE_CHECKING:
 ## for import functions related to falcon
 import falcon
 
+
+class HabitatConfigPlugin(SearchPathPlugin):
+    def manipulate_search_path(self, search_path: ConfigSearchPath) -> None:
+        search_path.append(provider="iros", path="00_iros_exp_config/")
+
+register_hydra_plugin(HabitatConfigPlugin)
 @hydra.main(
     version_base=None,
     config_path="config",

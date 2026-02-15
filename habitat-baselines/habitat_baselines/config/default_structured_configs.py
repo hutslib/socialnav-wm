@@ -350,6 +350,7 @@ class DDPPOConfig(HabitatBaselinesBaseConfig):
     rnn_type: str = "GRU"
     num_recurrent_layers: int = 1
     backbone: str = "resnet18"
+    resnet_baseplanes: int = 32
     # Visual encoder backbone
     pretrained_weights: str = "data/ddppo-models/gibson-2plus-resnet50.pth"
     # Initialize with pretrained weights
@@ -362,6 +363,9 @@ class DDPPOConfig(HabitatBaselinesBaseConfig):
     reset_critic: bool = True
     # Forces distributed mode for testing
     force_distributed: bool = False
+    # Param/buffer name substrings to exclude from DDP allreduce (e.g. decoupled WM).
+    # Example: [".net.world_model."] so params never receiving grad in PPO don't trigger reducer error.
+    ddp_ignore_param_patterns: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -443,6 +447,70 @@ class HydraCallbackConfig(HabitatBaselinesBaseConfig):
 
 
 @dataclass
+class WorldModelConfig(HabitatBaselinesBaseConfig):
+    """World Model 配置：模型结构 + 训练参数"""
+
+    # 开关
+    enabled: bool = False
+    train_world_model: bool = False
+
+    # 特征融合（policy 侧）
+    fusion_mode: str = "concat"
+
+    # Encoder / 视觉
+    encoder_type: str = "dreamer"
+    cnn_depth: int = 32
+    mlp_units: int = 256
+    kernel_size: int = 4
+    minres: int = 4
+
+    # RSSM
+    dyn_stoch: int = 30
+    dyn_deter: int = 200
+    dyn_hidden: int = 200
+    dyn_discrete: int = 32
+
+    # 通用
+    act: str = "SiLU"
+    norm: bool = True
+    num_actions: int = 4
+    visual_keys: Optional[List[str]] = None
+    fuse_keys_1d: Optional[List[str]] = None
+    human_state_goal_keys: Optional[List[str]] = None
+    num_humans: int = 6
+    pred_horizon: int = 5
+    use_goal_conditioning: bool = True
+    state_goal_dim: int = 8
+
+    # 训练策略
+    wm_train_ratio: float = 0.1
+    wm_warmup_updates: int = 1000
+    wm_grad_clip: float = 100.0
+
+    # WM 优化器与 batch
+    wm_lr: float = 3e-4
+    opt_eps: float = 1e-5
+    weight_decay: float = 0.0
+    wm_batch_size: int = 16
+    wm_sequence_length: int = 50
+    wm_epochs_per_update: int = 1
+
+    # Replay buffer
+    replay_buffer_size: int = 100000
+    replay_buffer_warmup: int = 5000
+
+    # Loss 权重
+    depth_loss_scale: float = 1.0
+    traj_loss_scale: float = 1.0
+    reward_loss_scale: float = 1.0
+    kl_loss_scale: float = 0.1
+    kl_free_bits: float = 1.0
+
+    # 分布式
+    ddp: bool = True
+
+
+@dataclass
 class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # task config can be a list of configs like "A.yaml,B.yaml"
     # If habitat_baselines.evaluate is true, the run will be in evaluation mode
@@ -499,6 +567,8 @@ class HabitatBaselinesConfig(HabitatBaselinesBaseConfig):
     # Function signature: fn(save_file_path: str) -> None
     # If not specified, there is no callback.
     on_save_ckpt_callback: Optional[HydraCallbackConfig] = None
+    # World Model 配置（模型结构 + 训练参数）
+    world_model: WorldModelConfig = field(default_factory=WorldModelConfig)
 
 
 @dataclass

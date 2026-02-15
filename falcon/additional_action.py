@@ -832,6 +832,11 @@ class OracleNavRandCoordAction_Obstacle(OracleNavObstacleAction):  # type: ignor
                         self.goals = None
             else:
                 self._add_n_coord_nav_goals(self.num_goals)
+        
+        # 初始化task._human_goals，供human_start_goal_sensor访问
+        if not hasattr(kwargs['task'], '_human_goals'):
+            kwargs['task']._human_goals = {}
+        kwargs['task']._human_goals[self._agent_index] = self.goals
 
     def _find_path_given_start_end(self, start, end):
         """Helper function to find the path given starting and end locations"""
@@ -978,6 +983,16 @@ class OracleNavRandCoordAction_Obstacle(OracleNavObstacleAction):  # type: ignor
                 kwargs["task"].measurements.measures["human_future_trajectory"].target_dict[self._agent_index - 1] = self.goals[self.current_goal_idx-1:] # .copy()
         except Exception:
             pass
+        
+        # 将goals暴露给task，供human_start_goal_sensor访问
+        if not hasattr(kwargs['task'], '_human_goals'):
+            kwargs['task']._human_goals = {}
+        # 存储当前agent的剩余goals（从下一个目标开始）
+        if self.goals is not None and self.current_goal_idx < len(self.goals):
+            kwargs['task']._human_goals[self._agent_index] = self.goals[self.current_goal_idx:]
+        else:
+            kwargs['task']._human_goals[self._agent_index] = None
+            
         return ret_val
 
 @dataclass

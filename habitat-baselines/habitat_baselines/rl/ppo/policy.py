@@ -75,6 +75,7 @@ class PolicyActionData:
     take_actions: Optional[torch.Tensor] = None
     policy_info: Optional[List[Dict[str, Any]]] = None
     should_inserts: Optional[torch.BoolTensor] = None
+    wm_features: Optional[torch.Tensor] = None
 
     def write_action(self, write_idx: int, write_action: torch.Tensor) -> None:
         """
@@ -329,7 +330,7 @@ class NetPolicy(nn.Module, Policy):
         masks,
         deterministic=False,
     ):
-        features, rnn_hidden_states, _ = self.net(
+        features, rnn_hidden_states, aux_loss_state = self.net(
             observations, rnn_hidden_states, prev_actions, masks
         )
         distribution = self.action_distribution(features)
@@ -349,6 +350,7 @@ class NetPolicy(nn.Module, Policy):
             actions=action,
             action_log_probs=action_log_probs,
             rnn_hidden_states=rnn_hidden_states,
+            wm_features=aux_loss_state.get("wm_feature_for_storage", None),
         )
 
     @g_timer.avg_time("net_policy.get_value", level=1)

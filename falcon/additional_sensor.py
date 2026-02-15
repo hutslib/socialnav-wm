@@ -478,3 +478,187 @@ cs.store(
     name="oracle_humanoid_future_trajectory",
     node=OracleHumanoidFutureTrajectorySensorConfig,
 )
+
+
+# ============================================================================
+# HumanStateGoalSensor - 融合传感器
+# ============================================================================
+
+@dataclass
+class HumanStateGoalSensorConfig(LabSensorConfig):
+    """Configuration for Human State and Goal Sensor"""
+    type: str = "HumanStateGoalSensor"
+    max_human_num: int = 6
+
+
+@registry.register_sensor
+class HumanStateGoalSensor(UsesArticulatedAgentInterface, Sensor):
+    """
+    融合传感器：提供人类的完整状态和目标信息
+    
+    Output shape: (max_human_num, 8)
+    Format per human: [pos_x, pos_z, vel_x, vel_z, goal_x, goal_z, rotation, dist_to_goal]
+    - pos_x, pos_z: 当前位置 (相对机器人)
+    - vel_x, vel_z: 当前速度 (2D速度向量)
+    - goal_x, goal_z: 目标位置 (相对机器人)
+    - rotation: 朝向角度 (弧度)
+    - dist_to_goal: 到目标的距离
+    
+    Invalid/missing humans are filled with -100
+    
+    Advantages:
+    - 单个sensor提供完整信息，减少sensor数量
+    - 整合位置、速度、目标，适合端到端预测
+    - 包含距离信息，便于判断目标达成
+    - 所有坐标统一相对机器人，便于处理
+    """
+    
+    cls_uuid: str = "human_state_goal"
+    
+    def __init__(self, *args, sim, task, **kwargs):
+        self._sim = sim
+        self._task = task
+        config = kwargs.get('config')
+        self.max_human_num = config.max_human_num if config and hasattr(config, 'max_human_num') else 6
+        super().__init__(*args, task=task, **kwargs)
+    
+    def _get_uuid(self, *args, **kwargs):
+        return HumanStateGoalSensor.cls_uuid
+    
+    def _get_sensor_type(self, *args, **kwargs):
+        return SensorTypes.TENSOR
+    
+    def _get_observation_space(self, *args, config=None, **kwargs):
+        return spaces.Box(
+            shape=(self.max_human_num, 8),
+            low=-100,
+            high=100,
+            dtype=np.float32,
+        )
+    
+    def get_observation(self, task, *args, **kwargs):
+        """
+        获取所有人类的状态和目标信息
+        
+        Returns:
+            np.array of shape (max_human_num, 8)
+            Each row: [pos_x, pos_z, vel_x, vel_z, goal_x, goal_z, rotation, dist_to_goal]
+        """
+        result = np.full((self.max_human_num, 8), -100, dtype=np.float32)
+        
+        # 获取机器人位置 (agent 0)
+        robot_data = self._sim.get_agent_data(0)
+        robot_pos = np.array(robot_data.articulated_agent.base_pos)[[0, 2]]
+        
+        # 获取每个人类agent的信息 (从agent 1开始)
+        num_agents = len(self._sim.agents_mgr)
+        
+        for i in range(1, min(self.max_human_num + 1, num_agents)):
+            try:
+                # 获取articulated agent
+                agent_data = self._sim.get_agent_data(i)
+                human = agent_data.articulated_agent
+                
+                # 1. 当前位置 (相对机器人)
+                human_pos = np.array(human.base_pos)[[0, 2]]
+                pos_relative = human_pos - robot_pos
+                
+                # 2. 当前速度
+                vel = self._get_human_velocity(i, task)
+                if vel is None:
+                    vel = np.array([0.0, 0.0])
+                
+                # 3. 朝向角度
+                rotation = float(human.base_rot)
+                
+                # 4. 目标位置 (相对机器人)
+                goal_pos = self._get_human_goal_position(i)
+                if goal_pos is not None:
+                    goal_pos_2d = np.array(goal_pos)[[0, 2]]
+                    goal_relative = goal_pos_2d - robot_pos
+                    
+                    # 5. 到目标的距离
+                    dist_to_goal = np.linalg.norm(goal_pos_2d - human_pos)
+                else:
+                    goal_relative = np.array([0.0, 0.0])
+                    dist_to_goal = 0.0
+                
+                # 组装特征向量
+                result[i-1] = [
+                    pos_relative[0],      # pos_x
+                    pos_relative[1],      # pos_z
+                    vel[0],               # vel_x
+                    vel[1],               # vel_z
+                    goal_relative[0],     # goal_x
+                    goal_relative[1],     # goal_z
+                    rotation,             # rotation
+                    dist_to_goal          # dist_to_goal
+                ]
+                
+            except (IndexError, AttributeError, KeyError):
+                continue
+        
+        return result
+    
+    def _get_human_velocity(self, agent_idx, task):
+        """获取人类的速度信息"""
+        try:
+            if hasattr(task, 'measurements') and hasattr(task.measurements, 'measures'):
+                if 'human_velocity_measure' in task.measurements.measures:
+                    vel_data = task.measurements.measures['human_velocity_measure']._metric
+                    if agent_idx - 1 < len(vel_data):
+                        vel = vel_data[agent_idx - 1]
+                        if isinstance(vel, (list, np.ndarray)) and len(vel) >= 2:
+                            return np.array(vel[:2], dtype=np.float32)
+        except Exception:
+            pass
+        return None
+    
+    def _get_human_goal_position(self, agent_idx):
+        """获取人类的目标位置（优先使用实时goals from action）"""
+        # 方法1: 从action暴露的实时goals获取（最优先）
+        if hasattr(self._task, '_human_goals'):
+            if agent_idx in self._task._human_goals:
+                goals = self._task._human_goals[agent_idx]
+                if goals is not None and len(goals) > 0:
+                    return np.array(goals[0])
+        
+        # 方法2: 从task缓存获取
+        if hasattr(self._task, '_human_goal_positions'):
+            if agent_idx in self._task._human_goal_positions:
+                return self._task._human_goal_positions[agent_idx]
+        
+        # 方法3: 从episode获取
+        if hasattr(self._task, '_episode'):
+            episode = self._task._episode
+            for attr_name in [
+                f'agent_{agent_idx}_goal',
+                f'agent{agent_idx}_goal_position',
+                'agent_goal_positions',
+            ]:
+                if hasattr(episode, attr_name):
+                    attr_val = getattr(episode, attr_name)
+                    if isinstance(attr_val, list) and agent_idx < len(attr_val):
+                        return np.array(attr_val[agent_idx])
+                    elif isinstance(attr_val, np.ndarray):
+                        return attr_val
+        
+        # 方法4: 从simulator的agent配置获取
+        try:
+            if hasattr(self._sim, 'agents_mgr'):
+                agent_name = self._sim.agents_mgr.agent_names[agent_idx]
+                agent_config = self._sim.habitat_config.agents[agent_name]
+                if hasattr(agent_config, 'goal_position'):
+                    return np.array(agent_config.goal_position)
+        except:
+            pass
+        
+        return None
+
+
+cs.store(
+    package="habitat.task.lab_sensors.human_state_goal_sensor",
+    group="habitat/task/lab_sensors",
+    name="human_state_goal_sensor",
+    node=HumanStateGoalSensorConfig,
+)

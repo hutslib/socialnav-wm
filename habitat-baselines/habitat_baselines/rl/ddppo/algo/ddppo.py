@@ -4,7 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -107,7 +107,11 @@ class DecentralizedDistributedMixin:
     def _compute_var_mean(x):
         return distributed_var_mean(x)
 
-    def init_distributed(self, find_unused_params: bool = True) -> None:
+    def init_distributed(
+        self,
+        find_unused_params: bool = True,
+        ddp_ignore_param_patterns: Optional[List[str]] = None,
+    ) -> None:
         r"""Initializes distributed training for the model
 
         1. Broadcasts the model weights from world_rank 0 to all other workers
@@ -118,6 +122,9 @@ class DecentralizedDistributedMixin:
                                    there are any parameters in the model that where unused in the
                                    forward pass, otherwise the gradient reduction
                                    will not work correctly.
+        :param ddp_ignore_param_patterns: Optional list of substrings; param/buffer names
+                                         containing any of these are excluded from DDP allreduce
+                                         (e.g. [".net.world_model."] for decoupled WM).
         """
 
         # NB: Used to hide the hooks from the nn.Module,
@@ -137,7 +144,26 @@ class DecentralizedDistributedMixin:
                         find_unused_parameters=find_unused_params,
                     )
 
-        self._evaluate_actions_wrapper = Guard(_EvalActionsWrapper(self.actor_critic), self.device)  # type: ignore
+        eval_actions_wrapper = _EvalActionsWrapper(self.actor_critic)
+
+        patterns = ddp_ignore_param_patterns or []
+        if len(patterns) > 0:
+            try:
+                ignored = []
+                for name, _ in eval_actions_wrapper.named_parameters():
+                    if any(p in name for p in patterns):
+                        ignored.append(name)
+                for name, _ in eval_actions_wrapper.named_buffers():
+                    if any(p in name for p in patterns):
+                        ignored.append(name)
+                if len(ignored) > 0:
+                    eval_actions_wrapper._ddp_params_and_buffers_to_ignore = ignored
+            except Exception:
+                pass
+
+        self._evaluate_actions_wrapper = Guard(
+            eval_actions_wrapper, self.device
+        )  # type: ignore
 
     def _evaluate_actions(self, *args, **kwargs):
         r"""Internal method that calls Policy.evaluate_actions.  This is used instead of calling

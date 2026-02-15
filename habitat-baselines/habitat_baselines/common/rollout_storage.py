@@ -119,6 +119,7 @@ class RolloutStorage(Storage):
         value_preds=None,
         rewards=None,
         next_masks=None,
+        wm_features=None,
         buffer_index: int = 0,
         **kwargs,
     ):
@@ -137,10 +138,20 @@ class RolloutStorage(Storage):
             action_log_probs=action_log_probs,
             value_preds=value_preds,
             rewards=rewards,
+            wm_features=wm_features,
         )
 
         next_step = {k: v for k, v in next_step.items() if v is not None}
         current_step = {k: v for k, v in current_step.items() if v is not None}
+
+        if wm_features is not None and "wm_features" not in self.buffers:
+            self.buffers["wm_features"] = torch.zeros(
+                self.num_steps + 1,
+                self._num_envs,
+                wm_features.shape[-1],
+                dtype=wm_features.dtype,
+                device=wm_features.device,
+            )
 
         env_slice = slice(
             int(buffer_index * self._num_envs / self._nbuffers),
@@ -244,6 +255,12 @@ class RolloutStorage(Storage):
             ][0:1]
 
             batch.map_in_place(lambda v: v.flatten(0, 1))
+
+            # use rollout-cached WM features during PPO update.
+            if "wm_features" in batch:
+                batch["observations"]["wm_cached_feature"] = batch[
+                    "wm_features"
+                ]
 
             batch["rnn_build_seq_info"] = build_rnn_build_seq_info(
                 device=self.device,

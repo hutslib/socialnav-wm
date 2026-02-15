@@ -20,6 +20,9 @@ from habitat_baselines.rl.ddppo.policy import (  # noqa: F401.
 from habitat_baselines.rl.hrl.hierarchical_policy import (  # noqa: F401.
     HierarchicalPolicy,
 )
+from habitat_baselines.rl.world_model.falcon_policy_v2 import (  # noqa: F401
+    SocialNavWMPolicyV2,
+)
 from habitat_baselines.rl.ppo.agent_access_mgr import AgentAccessMgr
 from habitat_baselines.rl.ppo.policy import NetPolicy
 from habitat_baselines.rl.ppo.ppo import PPO
@@ -175,8 +178,16 @@ class SingleAgentAccessMgr(AgentAccessMgr):
 
     def init_distributed(self, find_unused_params: bool = True) -> None:
         if len(list(self._updater.parameters())) > 0:
+            ddp_ignore = list(
+                getattr(
+                    self._config.habitat_baselines.rl.ddppo,
+                    "ddp_ignore_param_patterns",
+                    [],
+                )
+            )
             self._updater.init_distributed(
-                find_unused_params=find_unused_params
+                find_unused_params=find_unused_params,
+                ddp_ignore_param_patterns=ddp_ignore if ddp_ignore else None,
             )
 
     def _create_policy(self) -> NetPolicy:
@@ -209,7 +220,7 @@ class SingleAgentAccessMgr(AgentAccessMgr):
             )
 
         # adapt to multi-agent setup
-        if self._config.habitat_baselines.rl.ddppo.pretrained and (self.agent_name == "agent_0" or self.agent_name == "main_agent") : 
+        if self._config.habitat_baselines.rl.ddppo.pretrained and (self.agent_name == "agent_0" or self.agent_name == "main_agent") :
             # actor_critic.load_state_dict(
             #     {  # type: ignore
             #         k[len("actor_critic.") :]: v
@@ -229,7 +240,7 @@ class SingleAgentAccessMgr(AgentAccessMgr):
                 actor_critic.load_state_dict(model_state_dict, strict=False)
             else:
                 actor_critic.load_state_dict(
-                        { 
+                        {
                             k[len("actor_critic.") :]: v
                             for k, v in pretrained_state["state_dict"].items()
                         }

@@ -600,12 +600,16 @@ class SPL(Measure):
 
         self._previous_position = current_position
 
-        self._metric = ep_success * (
-            self._start_end_episode_distance
-            / max(
-                self._start_end_episode_distance, self._agent_episode_distance
-            )
+        denom = max(
+            self._start_end_episode_distance, self._agent_episode_distance
         )
+        if denom <= 0:
+            # Agent already at goal (start_end_distance=0) or no movement
+            self._metric = 1.0 if ep_success else 0.0
+        else:
+            self._metric = ep_success * (
+                self._start_end_episode_distance / denom
+            )
 
 
 @registry.register_measure
@@ -637,9 +641,12 @@ class SoftSPL(SPL):
             DistanceToGoal.cls_uuid
         ].get_metric()
 
-        ep_soft_success = max(
-            0, (1 - distance_to_target / self._start_end_episode_distance)
-        )
+        if self._start_end_episode_distance <= 0:
+            ep_soft_success = 1.0  # already at goal
+        else:
+            ep_soft_success = max(
+                0, (1 - distance_to_target / self._start_end_episode_distance)
+            )
 
         self._agent_episode_distance += self._euclidean_distance(
             current_position, self._previous_position
@@ -647,12 +654,15 @@ class SoftSPL(SPL):
 
         self._previous_position = current_position
 
-        self._metric = ep_soft_success * (
-            self._start_end_episode_distance
-            / max(
-                self._start_end_episode_distance, self._agent_episode_distance
-            )
+        denom = max(
+            self._start_end_episode_distance, self._agent_episode_distance
         )
+        if denom <= 0:
+            self._metric = ep_soft_success
+        else:
+            self._metric = ep_soft_success * (
+                self._start_end_episode_distance / denom
+            )
 
 
 @registry.register_measure

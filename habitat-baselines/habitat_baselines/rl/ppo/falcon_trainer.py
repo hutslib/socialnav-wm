@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 import hydra
 import numpy as np
 import torch
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 import habitat_baselines.rl.multi_agent  # noqa: F401.
@@ -37,6 +38,7 @@ from habitat_baselines.common.tensorboard_utils import (
 from habitat_baselines.rl.ddppo.algo import DDPPO  # noqa: F401.
 from habitat_baselines.rl.ddppo.ddp_utils import (
     EXIT,
+    SAVE_STATE,
     get_distrib_size,
     init_distrib_slurm,
     is_slurm_batch_job,
@@ -89,6 +91,124 @@ def contains_inf_or_nan(observations):
                         print(f"Key {key} contains inf or nan in list/tuple: {element}")
                         return True
     return False
+
+class _WorldModelTrainModule(torch.nn.Module):
+    """DDP-friendly wrapper that computes WM losses in one forward."""
+
+    def __init__(self, world_model: torch.nn.Module):
+        super().__init__()
+        self.world_model = world_model
+
+    def forward(self, batch: Dict[str, torch.Tensor], kl_free_bits: float):
+        # Encode observations: (B, T, ...) -> (B*T, ...)
+        batch_size, seq_len = batch["actions"].shape[:2]
+        flat_obs = {}
+        for key, val in batch["observations"].items():
+            assert val.shape[0] == batch_size and val.shape[1] == seq_len, (
+                f"Observation {key} has unexpected shape {val.shape}, "
+                f"expected (batch={batch_size}, time={seq_len}, ...)"
+            )
+            flat_obs[key] = val.reshape(batch_size * seq_len, *val.shape[2:])
+
+        flat_embed = self.world_model.encoder(flat_obs)
+        embed = flat_embed.reshape(batch_size, seq_len, -1)
+
+        actions_one_hot = F.one_hot(
+            batch["actions"].long().squeeze(-1),
+            num_classes=self.world_model.dynamics._num_actions,
+        ).float()
+
+        post, prior = self.world_model.dynamics.observe(
+            embed, actions_one_hot, batch["is_first"]
+        )
+        feat = self.world_model.dynamics.get_feat(post)
+
+        # Depth loss.
+        depth_key = next(
+            (k for k in batch["observations"] if "depth" in k.lower()),
+            None,
+        )
+        depth_dist = self.world_model.heads["depth"](feat)
+        if depth_key is not None:
+            depth_target = batch["observations"][depth_key]
+            depth_loss = -depth_dist.log_prob(depth_target).mean()
+        else:
+            depth_loss = depth_dist.mean().mean() * 0.0
+
+        # Human trajectory loss (force goal path active when enabled).
+        traj_head = self.world_model.heads["human_traj"]
+        traj_key = next(
+            (k for k in batch["observations"] if "future_trajectory" in k.lower()),
+            None,
+        )
+        human_state_goal = next(
+            (
+                batch["observations"][k]
+                for k in batch["observations"]
+                if "human_state_goal" in k
+            ),
+            None,
+        )
+        if human_state_goal is None and getattr(
+            traj_head, "use_goal_conditioning", False
+        ):
+            human_state_goal = feat.new_zeros(
+                batch_size,
+                seq_len,
+                traj_head.num_humans,
+                traj_head.state_goal_dim,
+            )
+        traj_dist = traj_head(
+            feat,
+            human_state_goal=human_state_goal,
+        )
+        traj_mean = traj_dist.mean()
+        if traj_key is not None:
+            traj_target = batch["observations"][traj_key]
+            num_humans = traj_target.shape[2]
+            human_num_key = next(
+                (k for k in batch["observations"] if "human_num" in k.lower()),
+                None,
+            )
+            if human_num_key is not None:
+                human_num = (
+                    batch["observations"][human_num_key]
+                    .squeeze(-1)
+                    .long()
+                    .clamp(0, num_humans)
+                )
+                mask = (
+                    torch.arange(num_humans, device=traj_target.device)
+                    < human_num.unsqueeze(-1)
+                ).float()
+                sq = (traj_mean - traj_target).pow(2).sum(dim=(-2, -1))
+                traj_loss = (sq * mask).sum() / mask.sum().clamp(min=1e-8)
+            else:
+                traj_loss = -traj_dist.log_prob(traj_target).mean()
+        else:
+            traj_loss = traj_mean.mean() * 0.0
+
+        # Reward loss.
+        reward_dist = self.world_model.heads["reward"](feat)
+        reward_target = batch["rewards"].float().reshape(batch_size, seq_len, -1)
+        if reward_target.dim() == 2:
+            reward_target = reward_target.unsqueeze(-1)
+        reward_loss = -reward_dist.log_prob(reward_target).mean()
+
+        # KL with free bits.
+        kl_loss = torch.distributions.kl.kl_divergence(
+            self.world_model.dynamics.get_dist(post),
+            self.world_model.dynamics.get_dist(prior),
+        )
+        kl_loss = torch.clamp(kl_loss - kl_free_bits, min=0.0).mean()
+
+        return {
+            "depth_loss": depth_loss,
+            "traj_loss": traj_loss,
+            "reward_loss": reward_loss,
+            "kl_loss": kl_loss,
+        }
+
 
 @baseline_registry.register_trainer(name="falcon_trainer")
 class FalconTrainer(BaseRLTrainer):
@@ -157,7 +277,7 @@ class FalconTrainer(BaseRLTrainer):
     def _init_envs(self, config=None, is_eval: bool = False):
         if config is None:
             config = self.config
-        # print(config) ## 
+        # print(config) ##
         env_factory: VectorEnvFactory = hydra.utils.instantiate(
             config.habitat_baselines.vector_env_factory
         )
@@ -304,7 +424,7 @@ class FalconTrainer(BaseRLTrainer):
                     batch[
                         PointNavResNetNet.PRETRAINED_VISUAL_FEATURES_KEY
                     ] = self._encoder(batch)
-        
+
         self._agent.rollouts.insert_first_observations(batch)
 
         self.current_episode_reward = torch.zeros(self.envs.num_envs, 1)
@@ -316,7 +436,145 @@ class FalconTrainer(BaseRLTrainer):
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
 
+        # ==================== World Model Training Setup ====================
+        self._init_world_model_training()
+
+        # Load WM optimizer state if resuming
+        if resume_state is not None and self.train_world_model:
+            self._load_wm_state(resume_state)
+
         self.t_start = time.time()
+
+    def _init_world_model_training(self):
+        """Initialize World Model training components"""
+        # Check if WM is enabled (supports both dict-like and structured WorldModelConfig)
+        wm_config = getattr(self.config.habitat_baselines, "world_model", None)
+        if wm_config is None:
+            self.use_world_model = False
+            self.train_world_model = False
+        else:
+            self.use_world_model = getattr(wm_config, "enabled", False)
+            self.train_world_model = self.use_world_model and getattr(
+                wm_config, "train_world_model", False
+            )
+
+        if not self.use_world_model or not self.train_world_model:
+            logger.info("World Model training is disabled")
+            return
+
+        logger.info("Initializing World Model training...")
+
+        # Get WM from policy
+        try:
+            if hasattr(self._agent.actor_critic, 'net'):
+                # Single agent
+                self.world_model = getattr(self._agent.actor_critic.net, 'world_model', None)
+            else:
+                # Multi-agent, get from first agent
+                self.world_model = getattr(self._agent._agents[0].actor_critic.net, 'world_model', None)
+
+            if self.world_model is None:
+                logger.warning("World Model not found in policy, disabling WM training")
+                self.train_world_model = False
+                return
+        except Exception as e:
+            logger.warning(f"Failed to get World Model: {e}, disabling WM training")
+            self.train_world_model = False
+            return
+
+        # WM training parameters (from config)
+        self.wm_train_ratio = getattr(wm_config, "wm_train_ratio", 0.1)
+        self.wm_warmup_updates = getattr(wm_config, "wm_warmup_updates", 1000)
+        self.wm_grad_clip = getattr(wm_config, "wm_grad_clip", 100.0)
+        self.wm_batch_size = getattr(wm_config, "wm_batch_size", 16)
+        self.wm_sequence_length = getattr(wm_config, "wm_sequence_length", 50)
+        self.wm_epochs_per_update = getattr(wm_config, "wm_epochs_per_update", 1)
+
+        # Loss scales
+        self.depth_loss_scale = getattr(wm_config, "depth_loss_scale", 1.0)
+        self.traj_loss_scale = getattr(wm_config, "traj_loss_scale", 1.0)
+        self.reward_loss_scale = getattr(wm_config, "reward_loss_scale", 1.0)
+        self.kl_loss_scale = getattr(wm_config, "kl_loss_scale", 0.1)
+        self.kl_free_bits = getattr(wm_config, "kl_free_bits", 1.0)
+
+        # Create WM optimizer
+        self.wm_optimizer = torch.optim.Adam(
+            self.world_model.parameters(),
+            lr=getattr(wm_config, "wm_lr", 3e-4),
+            eps=getattr(wm_config, "opt_eps", 1e-5),
+            weight_decay=getattr(wm_config, "weight_decay", 0.0),
+        )
+
+        # Build WM train wrapper and optionally wrap with DDP.
+        self.wm_train_model = _WorldModelTrainModule(self.world_model).to(
+            self.device
+        )
+        self.wm_ddp_enabled = False
+        wm_use_ddp = getattr(wm_config, "ddp", True)
+        if self._is_distributed and wm_use_ddp:
+            if self.device.type == "cuda":
+                device_index = (
+                    self.device.index if self.device.index is not None else 0
+                )
+                self.wm_train_model = torch.nn.parallel.DistributedDataParallel(
+                    self.wm_train_model,
+                    device_ids=[device_index],
+                    output_device=device_index,
+                    find_unused_parameters=False,
+                )
+            else:
+                self.wm_train_model = torch.nn.parallel.DistributedDataParallel(
+                    self.wm_train_model,
+                    find_unused_parameters=False,
+                )
+            self.wm_ddp_enabled = True
+
+        # Create replay buffer (env-wise trajectories, initialized lazily)
+        buffer_size = getattr(wm_config, "replay_buffer_size", 100000)
+        self.replay_buffer_size = buffer_size
+        self.replay_buffer = None
+        self.replay_buffer_num_envs = None
+        self.replay_buffer_env_capacity = None
+        self.replay_buffer_warmup = getattr(wm_config, "replay_buffer_warmup", 5000)
+
+        logger.info(f"World Model training initialized:")
+        logger.info(f"  - wm_train_ratio: {self.wm_train_ratio} (update every {int(1/self.wm_train_ratio)} policy updates)")
+        logger.info(f"  - wm_warmup_updates: {self.wm_warmup_updates}")
+        logger.info("  - wm_mode: decoupled (independent optimizer)")
+        logger.info(f"  - replay_buffer_size: {buffer_size}")
+        logger.info(f"  - wm_batch_size: {self.wm_batch_size}")
+        logger.info(f"  - wm_sequence_length: {self.wm_sequence_length}")
+        logger.info(f"  - wm_ddp: {self.wm_ddp_enabled}")
+
+        # WM is trained only by wm_optimizer, never by PPO loss.
+        self._set_world_model_grad_enabled(False)
+        self._clear_world_model_grads()
+
+    def _set_world_model_grad_enabled(self, enabled: bool) -> None:
+        if not hasattr(self, "world_model") or self.world_model is None:
+            return
+        for param in self.world_model.parameters():
+            param.requires_grad_(enabled)
+
+    def _clear_world_model_grads(self) -> None:
+        if not hasattr(self, "world_model") or self.world_model is None:
+            return
+        if hasattr(self, "wm_optimizer") and self.wm_optimizer is not None:
+            self.wm_optimizer.zero_grad(set_to_none=True)
+        for param in self.world_model.parameters():
+            param.grad = None
+
+    def _load_wm_state(self, resume_state):
+        """从 checkpoint 加载 World Model optimizer 状态"""
+        if 'wm_optimizer_state' in resume_state:
+            self.wm_optimizer.load_state_dict(resume_state['wm_optimizer_state'])
+            if rank0_only():
+                logger.info("Loaded WM optimizer state from checkpoint")
+
+        if 'replay_buffer_size' in resume_state:
+            buffer_size = resume_state['replay_buffer_size']
+            if rank0_only():
+                logger.info(f"Previous replay buffer had {buffer_size} experiences (buffer not restored)")
 
     @rank0_only
     @profiling_wrapper.RangeContext("save_checkpoint")
@@ -337,6 +595,16 @@ class FalconTrainer(BaseRLTrainer):
         }
         if extra_state is not None:
             checkpoint["extra_state"] = extra_state  # type: ignore
+
+        # Save World Model optimizer state
+        if self.train_world_model and hasattr(self, 'wm_optimizer'):
+            checkpoint["wm_optimizer_state"] = self.wm_optimizer.state_dict()
+            checkpoint["replay_buffer_size"] = self._get_replay_buffer_size()
+            if rank0_only():
+                logger.info(
+                    "Saving WM optimizer state "
+                    f"(replay buffer size: {self._get_replay_buffer_size()})"
+                )
 
         save_file_path = os.path.join(
             self.config.habitat_baselines.checkpoint_folder, file_name
@@ -366,7 +634,280 @@ class FalconTrainer(BaseRLTrainer):
             dict containing checkpoint info
         """
         return torch.load(checkpoint_path, *args, **kwargs)
-    
+
+    def _should_update_world_model(self, update):
+        """判断是否应该更新 World Model"""
+        if not self.train_world_model:
+            return False
+
+        # 检查 warmup
+        if update < self.wm_warmup_updates:
+            return False
+
+        # 检查 replay buffer 是否足够
+        if self._get_replay_buffer_size() < self.replay_buffer_warmup:
+            return False
+
+        # 检查更新频率（关键逻辑：wm_train_ratio）
+        update_interval = int(1 / self.wm_train_ratio)
+        if update % update_interval != 0:
+            return False
+
+        return True
+
+    def _get_replay_buffer_size(self) -> int:
+        """Get total WM replay size across all env trajectories."""
+        if self.replay_buffer is None:
+            return 0
+        return int(sum(len(env_buffer) for env_buffer in self.replay_buffer))
+
+    def _store_rollout_to_buffer(self, rollouts):
+        """将 rollout 数据存储到 replay buffer。兼容单智能体 RolloutStorage 与多智能体 MultiStorage。"""
+        if not self.train_world_model:
+            return
+
+        # 多智能体下 rollouts 为 MultiStorage，无 num_steps/buffers；用第一个 agent（如 robot）的 storage
+        if hasattr(rollouts, "_active_storages") and len(rollouts._active_storages) > 0:
+            storage = rollouts._active_storages[0]
+        else:
+            storage = rollouts
+
+        num_steps = getattr(storage, "num_steps", None)
+        if num_steps is None:
+            return
+        buffers = getattr(storage, "buffers", None)
+        if buffers is None:
+            return
+
+        obs_buf = buffers["observations"]
+        actions_buf = buffers["actions"]
+        rewards_buf = buffers["rewards"]
+        masks_buf = buffers["masks"]
+        num_envs = actions_buf.size(1)
+
+        if self.replay_buffer is None or self.replay_buffer_num_envs != num_envs:
+            # Keep global capacity roughly fixed while storing env-wise trajectories.
+            per_env_capacity = max(1, self.replay_buffer_size // num_envs)
+            self.replay_buffer = [deque(maxlen=per_env_capacity) for _ in range(num_envs)]
+            self.replay_buffer_num_envs = num_envs
+            self.replay_buffer_env_capacity = per_env_capacity
+            if rank0_only():
+                logger.info(
+                    "Initialized env-wise WM replay buffer: "
+                    f"num_envs={num_envs}, per_env_capacity={per_env_capacity}, "
+                    f"total_capacity~={per_env_capacity * num_envs}"
+                )
+
+        # 存到 CPU，避免 replay buffer 撑大 GPU 显存（采样 WM batch 时会 .to(device)）
+        for step in range(num_steps):
+            for env_idx in range(num_envs):
+                obs_dict = {}
+                for key in obs_buf.keys():
+                    t = obs_buf[key]
+                    obs_dict[key] = t[step, env_idx].detach().clone().cpu()
+                mask = masks_buf[step, env_idx].detach().clone().cpu()
+                experience = {
+                    "observations": obs_dict,
+                    "actions": actions_buf[step, env_idx].detach().clone().cpu(),
+                    "rewards": rewards_buf[step, env_idx].detach().clone().cpu(),
+                    "masks": mask,
+                    # is_first = not mask (当episode结束时mask=0,is_first=1)
+                    "is_first": (~mask.bool()).float().cpu(),
+                }
+                self.replay_buffer[env_idx].append(experience)
+
+    def _sample_wm_batch(self):
+        """从 env-wise replay buffer 采样连续子序列（每个序列来自单一 env）。"""
+        if self.replay_buffer is None:
+            return None
+
+        valid_env_ids = []
+        env_weights = []
+        for env_idx, env_buffer in enumerate(self.replay_buffer):
+            num_starts = len(env_buffer) - self.wm_sequence_length + 1
+            if num_starts > 0:
+                valid_env_ids.append(env_idx)
+                env_weights.append(num_starts)
+
+        if len(valid_env_ids) == 0:
+            return None
+
+        env_weights = np.asarray(env_weights, dtype=np.float64)
+        env_weights = env_weights / env_weights.sum()
+
+        # 收集 sequences（每个 sequence 来自同一 env 的连续片段）
+        batch_sequences = []
+        for _ in range(self.wm_batch_size):
+            env_idx = int(np.random.choice(valid_env_ids, p=env_weights))
+            env_traj = list(self.replay_buffer[env_idx])
+            max_start_idx = len(env_traj) - self.wm_sequence_length
+            start_idx = int(np.random.randint(0, max_start_idx + 1))
+            sequence = env_traj[start_idx : start_idx + self.wm_sequence_length]
+            batch_sequences.append(sequence)
+
+        # 转换为 tensor batch
+        batch = {}
+
+        # 处理 observations（需要特殊处理，因为是 dict）
+        obs_keys = batch_sequences[0][0]['observations'].keys()
+        batch['observations'] = {}
+        for key in obs_keys:
+            # Shape: [batch_size, sequence_length, ...]
+            batch['observations'][key] = torch.stack([
+                torch.stack([step['observations'][key] for step in seq])
+                for seq in batch_sequences
+            ]).to(self.device)
+
+        # 处理其他数据
+        for data_key in ['actions', 'rewards', 'masks', 'is_first']:
+            batch[data_key] = torch.stack([
+                torch.stack([step[data_key] for step in seq])
+                for seq in batch_sequences
+            ]).to(self.device)
+
+        return batch
+
+    def _get_wm_sampling_stats(self):
+        """Return WM sampling stats: valid env count and avg traj length."""
+        if self.replay_buffer is None:
+            return 0, 0.0
+
+        valid_env_lengths = [
+            len(env_buffer)
+            for env_buffer in self.replay_buffer
+            if len(env_buffer) >= self.wm_sequence_length
+        ]
+        if len(valid_env_lengths) == 0:
+            return 0, 0.0
+
+        return len(valid_env_lengths), float(np.mean(valid_env_lengths))
+
+    def _compute_kl_loss(self, post, prior):
+        """计算 KL divergence with free bits"""
+        # KL divergence between posterior and prior
+        kl_loss = torch.distributions.kl.kl_divergence(
+            self.world_model.dynamics.get_dist(post),
+            self.world_model.dynamics.get_dist(prior)
+        )
+
+        # Apply free bits (避免 KL collapse)
+        # Free bits: 只惩罚 KL > kl_free_bits 的部分
+        kl_loss = torch.clamp(kl_loss - self.kl_free_bits, min=0.0)
+
+        return kl_loss.mean()
+
+    def _update_world_model(self, update):
+        """训练 World Model"""
+        self._set_world_model_grad_enabled(True)
+        self.wm_train_model.train()
+
+        if rank0_only():
+            logger.info(f"[Update {update}] Updating World Model...")
+            valid_env_count, avg_env_length = self._get_wm_sampling_stats()
+            logger.info(
+                f"[Update {update}] WM sampling stats: "
+                f"valid_envs={valid_env_count}, avg_env_length={avg_env_length:.1f}"
+            )
+
+        wm_losses_sum = {
+            'depth_loss': 0.0,
+            'traj_loss': 0.0,
+            'reward_loss': 0.0,
+            'kl_loss': 0.0,
+            'total_loss': 0.0
+        }
+
+        num_batches_trained = 0
+
+        # 训练多个 epochs
+        for epoch in range(self.wm_epochs_per_update):
+            # 1. 从 replay buffer 采样 sequences
+            batch = self._sample_wm_batch()
+
+            # DDP safety: all ranks must make the same control-flow decision.
+            if self._is_distributed and torch.distributed.is_initialized():
+                has_batch = torch.tensor(
+                    1 if batch is not None else 0,
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+                torch.distributed.all_reduce(
+                    has_batch, op=torch.distributed.ReduceOp.MIN
+                )
+                global_has_batch = int(has_batch.item()) == 1
+                if not global_has_batch:
+                    if rank0_only():
+                        logger.warning(
+                            f"[Update {update}] Global replay buffer too small, "
+                            "skipping WM update this round"
+                        )
+                    break
+
+            if batch is None:
+                if rank0_only():
+                    logger.warning(f"[Update {update}] Replay buffer too small, skipping WM update")
+                break
+
+            # WMP-style alignment: always treat the first step of each sampled
+            # sequence as a new sequence start.
+            batch['is_first'][:, 0] = 1.0
+
+            # 2. WM forward pass (through DDP wrapper if enabled)
+            wm_losses = self.wm_train_model(batch, self.kl_free_bits)
+            depth_loss = wm_losses["depth_loss"]
+            traj_loss = wm_losses["traj_loss"]
+            reward_loss = wm_losses["reward_loss"]
+            kl_loss = wm_losses["kl_loss"]
+
+            # 4. Total WM loss
+            wm_loss = (
+                depth_loss * self.depth_loss_scale +
+                traj_loss * self.traj_loss_scale +
+                reward_loss * self.reward_loss_scale +
+                kl_loss * self.kl_loss_scale
+            )
+
+            # 5. Backward and optimizer step
+            self.wm_optimizer.zero_grad()
+            wm_loss.backward()
+
+            # 梯度裁剪
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.world_model.parameters(),
+                self.wm_grad_clip
+            )
+
+            self.wm_optimizer.step()
+
+            # 累积 losses
+            wm_losses_sum['depth_loss'] += depth_loss.item()
+            wm_losses_sum['traj_loss'] += traj_loss.item()
+            wm_losses_sum['reward_loss'] += reward_loss.item()
+            wm_losses_sum['kl_loss'] += kl_loss.item()
+            wm_losses_sum['total_loss'] += wm_loss.item()
+            num_batches_trained += 1
+
+        # Keep WM optimizer path isolated from PPO path.
+        self._clear_world_model_grads()
+        self._set_world_model_grad_enabled(False)
+
+        # 平均 losses
+        if num_batches_trained > 0:
+            for key in wm_losses_sum:
+                wm_losses_sum[key] /= num_batches_trained
+
+        if rank0_only():
+            logger.info(
+                f"[Update {update}] WM training completed: "
+                f"depth={wm_losses_sum['depth_loss']:.3f}, "
+                f"traj={wm_losses_sum['traj_loss']:.3f}, "
+                f"reward={wm_losses_sum['reward_loss']:.3f}, "
+                f"kl={wm_losses_sum['kl_loss']:.3f}, "
+                f"total={wm_losses_sum['total_loss']:.3f}"
+            )
+
+        return wm_losses_sum
+
     def _compute_actions_and_step_envs(self, buffer_index: int = 0):
         num_envs = self.envs.num_envs
         env_slice = slice(
@@ -388,10 +929,6 @@ class FalconTrainer(BaseRLTrainer):
                 for k, v in step_batch.items()
                 if k.startswith("index_len")
             }
-            # contains_inf_or_nan(step_batch["observations"])
-            # contains_inf_or_nan(step_batch["recurrent_hidden_states"])
-            # contains_inf_or_nan(step_batch["prev_actions"])
-            # contains_inf_or_nan(step_batch["masks"])
             action_data = self._agent.actor_critic.act(
                 step_batch["observations"],
                 step_batch["recurrent_hidden_states"],
@@ -426,6 +963,7 @@ class FalconTrainer(BaseRLTrainer):
                 actions=action_data.actions,
                 action_log_probs=action_data.action_log_probs,
                 value_preds=action_data.values,
+                wm_features=action_data.wm_features,
                 buffer_index=buffer_index,
                 should_inserts=action_data.should_inserts,
                 action_data=action_data,
@@ -528,11 +1066,43 @@ class FalconTrainer(BaseRLTrainer):
         self._compute_actions_and_step_envs()
         return self._collect_environment_result()
 
+    def _inject_bootstrap_wm_cached_feature(self, step_batch):
+        """Inject rollout-cached WM feature for last-step value bootstrap."""
+        wm_key = "wm_cached_feature"
+        rollouts = self._agent.rollouts
+
+        # Single-agent storage path.
+        if hasattr(rollouts, "buffers"):
+            if (
+                "wm_features" in rollouts.buffers
+                and rollouts.current_rollout_step_idx > 0
+            ):
+                step_batch["observations"][wm_key] = rollouts.buffers[
+                    "wm_features"
+                ][rollouts.current_rollout_step_idx - 1]
+            return
+
+        # Multi-agent storage path.
+        if hasattr(rollouts, "_active_storages"):
+            for agent_i, storage in enumerate(rollouts._active_storages):
+                if storage is None or not hasattr(storage, "buffers"):
+                    continue
+                if (
+                    "wm_features" in storage.buffers
+                    and storage.current_rollout_step_idx > 0
+                ):
+                    step_batch["observations"][
+                        f"agent_{agent_i}_{wm_key}"
+                    ] = storage.buffers["wm_features"][
+                        storage.current_rollout_step_idx - 1
+                    ]
+
     @profiling_wrapper.RangeContext("_update_agent")
     @g_timer.avg_time("trainer.update_agent")
     def _update_agent(self):
         with inference_mode():
             step_batch = self._agent.rollouts.get_last_step()
+            self._inject_bootstrap_wm_cached_feature(step_batch)
             step_batch_lens = {
                 k: v
                 for k, v in step_batch.items()
@@ -556,10 +1126,18 @@ class FalconTrainer(BaseRLTrainer):
 
         self._agent.train()
 
+        # Decoupled mode: ensure PPO update never touches WM params.
+        if self.use_world_model:
+            self._set_world_model_grad_enabled(False)
+            self._clear_world_model_grads()
+
         losses = self._agent.updater.update(self._agent.rollouts)
 
         self._agent.rollouts.after_update()
         self._agent.after_update()
+
+        if self.use_world_model:
+            self._clear_world_model_grads()
 
         return losses
 
@@ -651,6 +1229,14 @@ class FalconTrainer(BaseRLTrainer):
             self.num_updates_done % self.config.habitat_baselines.log_interval
             == 0
         ):
+            logger.info("")
+
+            # Calculate progress and timing
+            progress_pct = self.percent_done() * 100
+            total_steps = self.config.habitat_baselines.total_num_steps
+            remaining_steps = max(total_steps - self.num_steps_done, 0)
+            elapsed_time = (time.time() - self.t_start) + prev_time
+
             logger.info(
                 "update: {}\tfps: {:.3f}\t".format(
                     self.num_updates_done,
@@ -659,26 +1245,89 @@ class FalconTrainer(BaseRLTrainer):
             )
 
             logger.info(
-                f"Num updates: {self.num_updates_done}\tNum frames {self.num_steps_done}"
+                f"Num updates: {self.num_updates_done}\tNum frames: {self.num_steps_done}"
             )
 
             logger.info(
-                "Average window size: {}  {}".format(
-                    len(self.window_episode_stats["count"]),
-                    "  ".join(
-                        "{}: {:.3f}".format(k, v / deltas["count"])
-                        for k, v in deltas.items()
-                        if k != "count"
-                    ),
+                f"Progress: {progress_pct:.2f}% ({self.num_steps_done}/{total_steps} steps) | "
+                f"Remaining: {remaining_steps} steps"
+            )
+
+            if self.num_steps_done > 0:
+                time_per_step = elapsed_time / self.num_steps_done
+                estimated_remaining_time = time_per_step * remaining_steps
+                hours_remaining = estimated_remaining_time / 3600
+                logger.info(
+                    f"Elapsed: {elapsed_time/3600:.2f}h | Estimated remaining: "
+                    f"{hours_remaining:.2f}h ({hours_remaining/24:.2f} days)"
+                )
+
+            # Calculate next checkpoint progress
+            if self.config.habitat_baselines.num_checkpoints != -1:
+                checkpoint_interval_steps = (
+                    total_steps / self.config.habitat_baselines.num_checkpoints
+                )
+                next_checkpoint_num = int(
+                    self.num_steps_done / checkpoint_interval_steps
+                ) + 1
+                next_checkpoint_steps = next_checkpoint_num * checkpoint_interval_steps
+                steps_to_next_ckpt = max(
+                    int(next_checkpoint_steps - self.num_steps_done), 0
+                )
+                pct_to_next_ckpt = (
+                    (self.num_steps_done % checkpoint_interval_steps)
+                    / checkpoint_interval_steps
+                    * 100
+                )
+                logger.info(
+                    f"Next checkpoint: ckpt.{next_checkpoint_num} | "
+                    f"Progress to next: {pct_to_next_ckpt:.1f}% "
+                    f"({steps_to_next_ckpt} steps remaining)"
+                )
+
+            if self.train_world_model:
+                logger.info(
+                    "WM replay status: "
+                    f"{self._get_replay_buffer_size()}/{self.replay_buffer_size} "
+                    f"(warmup={self.replay_buffer_warmup})"
+                )
+
+            logger.info("  --- Losses ---")
+            for k, v in sorted(losses.items()):
+                logger.info(f"    {k}: {v:.4f}")
+
+            logger.info(
+                "  --- 窗口指标 (window_size={}) ---".format(
+                    len(self.window_episode_stats["count"])
                 )
             )
-            perf_stats_str = " ".join(
-                [f"{k}: {v.mean:.3f}" for k, v in g_timer.items()]
-            )
-            logger.info(f"\tPerf Stats: {perf_stats_str}")
+            logger.info(f"    count: {deltas['count']:.4f}")
+            for k in sorted(deltas.keys()):
+                if k == "count":
+                    continue
+                logger.info(f"    {k}: {(deltas[k] / deltas['count']):.4f}")
+
+            logger.info("  --- Perf (mean) ---")
+            for k, v in g_timer.items():
+                logger.info(f"    {k}: {v.mean:.3f}s")
+
             if self.config.habitat_baselines.should_log_single_proc_infos:
+                logger.info("  --- Single-proc infos ---")
                 for k, v in self._single_proc_infos.items():
-                    logger.info(f" - {k}: {np.mean(v):.3f}")
+                    logger.info(f"    {k}: {np.mean(v):.4f}")
+
+            if torch.cuda.is_available():
+                try:
+                    alloc = torch.cuda.memory_allocated() / (1024**3)
+                    reserved = torch.cuda.memory_reserved() / (1024**3)
+                    logger.info(
+                        "  --- GPU ---  "
+                        f"alloc: {alloc:.2f} GB  |  reserved: {reserved:.2f} GB"
+                    )
+                except Exception:
+                    pass
+
+            logger.info("=" * 70)
 
     def should_end_early(self, rollout_step) -> bool:
         if not self._is_distributed:
@@ -746,7 +1395,8 @@ class FalconTrainer(BaseRLTrainer):
 
                 self._agent.pre_rollout()
 
-                if rank0_only() and self._should_save_resume_state():
+                # Resume state on preemption signal only (resume 与 ckpt 同频，见下方 save_checkpoint 处)
+                if rank0_only() and SAVE_STATE.is_set():
                     requeue_stats = dict(
                         count_checkpoints=count_checkpoints,
                         num_steps_done=self.num_steps_done,
@@ -757,7 +1407,6 @@ class FalconTrainer(BaseRLTrainer):
                         window_episode_stats=dict(self.window_episode_stats),
                         run_id=writer.get_run_id(),
                     )
-
                     save_resume_state(
                         dict(
                             **self._agent.get_resume_state(),
@@ -814,9 +1463,14 @@ class FalconTrainer(BaseRLTrainer):
 
                 profiling_wrapper.range_pop()  # rollouts loop
 
+                # ==================== Store rollouts to replay buffer ====================
+                if self.train_world_model:
+                    self._store_rollout_to_buffer(self._agent.rollouts)
+
                 if self._is_distributed:
                     self.num_rollouts_done_store.add("num_done", 1)
 
+                # ==================== Policy Update ====================
                 losses = self._update_agent()
 
                 self.num_updates_done += 1
@@ -825,9 +1479,16 @@ class FalconTrainer(BaseRLTrainer):
                     count_steps_delta,
                 )
 
+                # ==================== World Model Update (if needed) ====================
+                if self._should_update_world_model(self.num_updates_done):
+                    wm_losses = self._update_world_model(self.num_updates_done)
+                    # 添加 WM losses 到总 losses
+                    for key, value in wm_losses.items():
+                        losses[f'wm_{key}'] = value
+
                 self._training_log(writer, losses, prev_time)
 
-                # checkpoint model
+                # checkpoint model（resume state 与 ckpt 同频保存）
                 if rank0_only() and self.should_checkpoint():
                     self.save_checkpoint(
                         f"ckpt.{count_checkpoints}.pth",
@@ -836,8 +1497,27 @@ class FalconTrainer(BaseRLTrainer):
                             wall_time=(time.time() - self.t_start) + prev_time,
                         ),
                     )
-                    print(f'PPO save to ckpt.{count_checkpoints}.pth ')
+                    logger.info(f"Saved checkpoint ckpt.{count_checkpoints}.pth")
                     count_checkpoints += 1
+                    # 与 ckpt 同频写 resume state，便于断点续训
+                    requeue_stats = dict(
+                        count_checkpoints=count_checkpoints,
+                        num_steps_done=self.num_steps_done,
+                        num_updates_done=self.num_updates_done,
+                        _last_checkpoint_percent=self._last_checkpoint_percent,
+                        prev_time=(time.time() - self.t_start) + prev_time,
+                        running_episode_stats=self.running_episode_stats,
+                        window_episode_stats=dict(self.window_episode_stats),
+                        run_id=writer.get_run_id(),
+                    )
+                    save_resume_state(
+                        dict(
+                            **self._agent.get_resume_state(),
+                            config=self.config,
+                            requeue_stats=requeue_stats,
+                        ),
+                        self.config,
+                    )
 
                 profiling_wrapper.range_pop()  # train update
 
