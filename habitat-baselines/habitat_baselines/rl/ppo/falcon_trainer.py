@@ -1152,7 +1152,7 @@ class FalconTrainer(BaseRLTrainer):
         stats = self._all_reduce(stats)
 
         for i, k in enumerate(stats_ordering):
-            self.window_episode_stats[k].append(stats[i])
+            self.window_episode_stats[k].append(stats[i].clone())
 
         if self._is_distributed:
             loss_name_ordering = sorted(losses.keys())
