@@ -14,7 +14,7 @@ habitat_baselines:
     encoder_type: falcon
     falcon_backbone: resnet50
     falcon_baseplanes: 32
-    falcon_ngroups: 32
+    falcon_ngroups: 16
     falcon_use_projection: True
     falcon_target_dim: 512
     falcon_pretrained_path: pretrained_model/pretrained_habitat3.pth

@@ -464,6 +464,15 @@ class WorldModelConfig(HabitatBaselinesBaseConfig):
     kernel_size: int = 4
     minres: int = 4
 
+    # Falcon encoder（当 encoder_type=falcon 时使用，与 policy 的 ddppo 一致）
+    falcon_backbone: str = "resnet50"
+    falcon_baseplanes: int = 32
+    falcon_ngroups: int = 16
+    falcon_use_projection: bool = True
+    falcon_target_dim: int = 512
+    falcon_pretrained_path: Optional[str] = None
+    falcon_strict_load: bool = False
+
     # RSSM
     dyn_stoch: int = 30
     dyn_deter: int = 200

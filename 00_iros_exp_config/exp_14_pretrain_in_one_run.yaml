@@ -1,0 +1,34 @@
+# @package _global_
+# 实验 14: 单程序内先采后训（baseline 采数据 → 内存训 WM → 再训 Falcon+WM）
+# 用预训练 Falcon baseline（无 WM）采集数据，不落盘，一次跑完
+
+defaults:
+  - exp_05_falcon_encoder
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_14_pretrain_in_one_run/tb"
+  video_dir: "experiments/exp_14_pretrain_in_one_run/video"
+  checkpoint_folder: "experiments/exp_14_pretrain_in_one_run/checkpoints"
+
+  world_model:
+    enabled: true
+    train_world_model: true
+    fusion_mode: late  # 后融合 + deter feature（与 exp_12 一致）
+
+    # 单程序内先采后训（不落盘）：每轮 rollout N 次 → 从 buffer 更新 WM，重复 wm_pretrain_epochs 轮
+    wm_pretrain_in_one_run: true
+    # 每轮采集的 rollout 次数；可减小以省显存（每轮数据量 = collect_updates * num_steps * num_envs）
+    wm_pretrain_collect_updates: 50     # 例：50*128*28=179200 步/轮，100 轮共约 1792 万步
+    wm_pretrain_epochs: 100
+    baseline_checkpoint_path: "experiments/exp_01_baseline_falcon/checkpoints/latest.pth"  # Falcon 无 WM 的 ckpt
+
+    wm_warmup_updates: 0                # 已做 in-run 预训练，无需再 warmup
+    wm_train_ratio: 0.1
+    wm_grad_clip: 100.0
+    # 只需容纳一轮数据：>= wm_pretrain_collect_updates*num_steps*num_envs，且 >= (wm_sequence_length+wm_batch_size-1)*num_envs
+    replay_buffer_size: 200000          # 50*128*28=179200，略放大即可
+    replay_buffer_warmup: 5000
+    wm_sequence_length: 50
+    wm_batch_size: 16
+    wm_epochs_per_update: 10

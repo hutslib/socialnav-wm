@@ -98,7 +98,7 @@ habitat_baselines:
   video_dir: "experiments/exp_01_baseline_falcon/video"
   checkpoint_folder: "experiments/exp_01_baseline_falcon/checkpoints"
   test_episode_count: -1
-  num_environments: 32
+  num_environments: 28
   num_updates: -1
   total_num_steps: 15000000
   log_interval: 2
@@ -147,8 +147,8 @@ habitat_baselines:
     ddppo:
       sync_frac: 0.6
       distrib_backend: NCCL
-      pretrained_weights: pretrained_model/pretrained_habitat3.pth
-      pretrained: True
+      pretrained_weights: ""
+      pretrained: False
       pretrained_encoder: False
       train_encoder: True
       reset_critic: True

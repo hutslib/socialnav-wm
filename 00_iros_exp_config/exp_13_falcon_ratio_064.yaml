@@ -1,0 +1,18 @@
+# @package _global_
+# 实验 13: Falcon Encoder + ratio 64 (每 64 次 PPO 做 1 次 WM, ratio=0.015625)
+
+defaults:
+  - exp_05_falcon_encoder
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_13_falcon_ratio_064/tb"
+  video_dir: "experiments/exp_13_falcon_ratio_064/video"
+  checkpoint_folder: "experiments/exp_13_falcon_ratio_064/checkpoints"
+
+  world_model:
+    fusion_mode: late  # 后融合 + deter feature（deter 在代码中已默认）
+    wm_train_ratio: 0.015625
+    wm_warmup_updates: 2
+    wm_grad_clip: 100.0
+    wm_epochs_per_update: 966  # 与 full 总 epoch 一致: 65×966≈62790
