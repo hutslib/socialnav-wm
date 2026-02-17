@@ -777,6 +777,7 @@ class SocialNavWMPolicyV2(NetPolicy):
             if use_world_model:
                 num_actions = action_space.n if hasattr(action_space, "n") else 4
                 wm_config_dict = {
+                    "encoder_type": getattr(wm_cfg, "encoder_type", "dreamer"),
                     "dyn_stoch": getattr(wm_cfg, "dyn_stoch", 30),
                     "dyn_deter": getattr(wm_cfg, "dyn_deter", 200),
                     "dyn_hidden": getattr(wm_cfg, "dyn_hidden", 200),
@@ -795,6 +796,14 @@ class SocialNavWMPolicyV2(NetPolicy):
                     "pred_horizon": getattr(wm_cfg, "pred_horizon", 5),
                     "use_goal_conditioning": getattr(wm_cfg, "use_goal_conditioning", True),
                     "state_goal_dim": getattr(wm_cfg, "state_goal_dim", 8),
+                    # Falcon encoder options (used when encoder_type == "falcon")
+                    "falcon_backbone": getattr(wm_cfg, "falcon_backbone", "resnet18"),
+                    "falcon_baseplanes": getattr(wm_cfg, "falcon_baseplanes", 32),
+                    "falcon_ngroups": getattr(wm_cfg, "falcon_ngroups", 16),
+                    "falcon_use_projection": getattr(wm_cfg, "falcon_use_projection", False),
+                    "falcon_target_dim": getattr(wm_cfg, "falcon_target_dim", 512),
+                    "falcon_pretrained_path": getattr(wm_cfg, "falcon_pretrained_path", None),
+                    "falcon_strict_load": getattr(wm_cfg, "falcon_strict_load", False),
                 }
 
                 class WMConfig:

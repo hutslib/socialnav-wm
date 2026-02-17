@@ -209,48 +209,87 @@ class SingleAgentAccessMgr(AgentAccessMgr):
             orig_action_space=self._env_spec.orig_action_space,
             agent_name=self.agent_name,
         )
+        pretrained_model_state = None
         if (
-            self._config.habitat_baselines.rl.ddppo.pretrained_encoder
-            or self._config.habitat_baselines.rl.ddppo.pretrained
+            self.agent_name in ("agent_0", "main_agent")
+            and (
+                self._config.habitat_baselines.rl.ddppo.pretrained_encoder
+                or self._config.habitat_baselines.rl.ddppo.pretrained
+            )
         ):
             pretrained_state = torch.load(
                 self._config.habitat_baselines.rl.ddppo.pretrained_weights,
                 map_location="cpu",
                 weights_only=False,
             )
+            if isinstance(pretrained_state, dict) and "state_dict" in pretrained_state:
+                # Single-agent ckpt format: {"state_dict": ...}
+                pretrained_model_state = pretrained_state["state_dict"]
+            elif (
+                isinstance(pretrained_state, dict)
+                and 0 in pretrained_state
+                and isinstance(pretrained_state[0], dict)
+                and "state_dict" in pretrained_state[0]
+            ):
+                # Multi-agent ckpt format: {0: {"state_dict": ...}, 1: ...}
+                pretrained_model_state = pretrained_state[0]["state_dict"]
+            elif (
+                isinstance(pretrained_state, dict)
+                and "0" in pretrained_state
+                and isinstance(pretrained_state["0"], dict)
+                and "state_dict" in pretrained_state["0"]
+            ):
+                pretrained_model_state = pretrained_state["0"]["state_dict"]
+
+            if pretrained_model_state is None:
+                raise KeyError(
+                    "Cannot find pretrained state_dict in checkpoint. "
+                    "Expected either top-level 'state_dict' or per-agent "
+                    "entry like ckpt[0]['state_dict'] for multi-agent checkpoints."
+                )
+            # Support both key styles:
+            # 1) actor_critic.xxx  2) xxx
+            pretrained_model_state = {
+                (
+                    k[len("actor_critic.") :]
+                    if isinstance(k, str) and k.startswith("actor_critic.")
+                    else k
+                ): v
+                for k, v in pretrained_model_state.items()
+            }
 
         # adapt to multi-agent setup
-        if self._config.habitat_baselines.rl.ddppo.pretrained and (self.agent_name == "agent_0" or self.agent_name == "main_agent") :
-            # actor_critic.load_state_dict(
-            #     {  # type: ignore
-            #         k[len("actor_critic.") :]: v
-            #         for k, v in pretrained_state["state_dict"].items()
-            #     }
-            # )
-            # adapt to better reload checkpoints
-            if "oracle_humanoid_future_trajectory" in self._env_spec.observation_space.spaces:
+        if (
+            self.agent_name in ("agent_0", "main_agent")
+            and self._config.habitat_baselines.rl.ddppo.pretrained
+        ):
+            needs_shape_filtered_load = (
+                "oracle_humanoid_future_trajectory"
+                in self._env_spec.observation_space.spaces
+                or bool(self._config.habitat_baselines.rl.auxiliary_losses)
+            )
+            if needs_shape_filtered_load:
                 model_state_dict = actor_critic.state_dict()
-                filtered_pretrained_state_dict = {k[len("actor_critic.") :]: v for k, v in pretrained_state["state_dict"].items() if k[len("actor_critic.") :] in model_state_dict and v.shape == model_state_dict[k[len("actor_critic.") :]].shape}
-                model_state_dict.update(filtered_pretrained_state_dict)
-                actor_critic.load_state_dict(model_state_dict, strict=False)
-            elif self._config.habitat_baselines.rl.auxiliary_losses:
-                model_state_dict = actor_critic.state_dict()
-                filtered_pretrained_state_dict = {k[len("actor_critic.") :]: v for k, v in pretrained_state["state_dict"].items() if k[len("actor_critic.") :] in model_state_dict and v.shape == model_state_dict[k[len("actor_critic.") :]].shape}
+                filtered_pretrained_state_dict = {
+                    k: v
+                    for k, v in pretrained_model_state.items()
+                    if k in model_state_dict and v.shape == model_state_dict[k].shape
+                }
                 model_state_dict.update(filtered_pretrained_state_dict)
                 actor_critic.load_state_dict(model_state_dict, strict=False)
             else:
                 actor_critic.load_state_dict(
-                        {
-                            k[len("actor_critic.") :]: v
-                            for k, v in pretrained_state["state_dict"].items()
-                        }
+                        pretrained_model_state
                     )
-        elif self._config.habitat_baselines.rl.ddppo.pretrained_encoder:
+        elif (
+            self.agent_name in ("agent_0", "main_agent")
+            and self._config.habitat_baselines.rl.ddppo.pretrained_encoder
+        ):
             prefix = "actor_critic.net.visual_encoder."
             actor_critic.net.visual_encoder.load_state_dict(
                 {
                     k[len(prefix) :]: v
-                    for k, v in pretrained_state["state_dict"].items()
+                    for k, v in pretrained_model_state.items()
                     if k.startswith(prefix)
                 }
             )

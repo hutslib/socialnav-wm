@@ -22,8 +22,10 @@
 import numpy as np
 import torch
 from torch import nn
+import gym.spaces as spaces
 from habitat_baselines.rl.ddppo.policy.resnet_policy import ResNetEncoder
 from habitat_baselines.rl.world_model.networks import (
+    VISUAL_KEYS_DEFAULT,
     FUSE_KEYS_1D_DEFAULT,
     HUMAN_STATE_GOAL_KEYS_DEFAULT,
 )
@@ -55,6 +57,7 @@ class FalconEncoderAdapter(nn.Module):
         hidden_size=256,
         use_projection=False,
         target_dim=512,
+        visual_keys=None,
         fuse_keys_1d=None,
         human_state_goal_keys=None,
     ):
@@ -67,18 +70,28 @@ class FalconEncoderAdapter(nn.Module):
             hidden_size: Hidden size for 1D sensor encoders
             use_projection: Whether to project visual features to target_dim
             target_dim: Target dimension for visual projection
+            visual_keys: 3D 视觉观测 key 子串列表，None 时用 VISUAL_KEYS_DEFAULT
             fuse_keys_1d: 1D 观测 key 子串列表，None 时用 FUSE_KEYS_1D_DEFAULT
             human_state_goal_keys: state_goal 2D key 子串，None 时用 HUMAN_STATE_GOAL_KEYS_DEFAULT
         """
         super().__init__()
+        _allow_visual = visual_keys if visual_keys is not None else VISUAL_KEYS_DEFAULT
         _allow_1d = fuse_keys_1d if fuse_keys_1d is not None else FUSE_KEYS_1D_DEFAULT
         _allow_hs = human_state_goal_keys if human_state_goal_keys is not None else HUMAN_STATE_GOAL_KEYS_DEFAULT
 
         # ==================== Part 1: Falcon Visual Encoder (复用Falcon代码) ====================
-        # 保持与 Falcon ResNetEncoder 完全相同的顺序
+        # 保持与 Falcon ResNetEncoder
+
+        visual_obs_space = spaces.Dict(
+            {
+                k: v
+                for k, v in observation_space.spaces.items()
+                if any(allow in k for allow in _allow_visual)
+            }
+        )
 
         self.visual_encoder = ResNetEncoder(
-            observation_space=observation_space,
+            observation_space=visual_obs_space,
             baseplanes=baseplanes,
             ngroups=ngroups,
             spatial_size=128,

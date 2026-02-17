@@ -65,6 +65,7 @@ class SocialNavWorldModel(nn.Module):
                 hidden_size=config.get('mlp_units', 256),
                 use_projection=config.get('falcon_use_projection', False),
                 target_dim=config.get('falcon_target_dim', 512),
+                visual_keys=config.get('visual_keys'),
                 fuse_keys_1d=config.get('fuse_keys_1d'),
                 human_state_goal_keys=config.get('human_state_goal_keys'),
             )
