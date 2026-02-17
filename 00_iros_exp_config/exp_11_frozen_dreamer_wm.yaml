@@ -1,0 +1,16 @@
+# @package _global_
+# 实验 11: Frozen Dreamer WM (冻结 Dreamer WM，仅用其特征训练 policy)
+# 目的: 对比 frozen Falcon WM (exp_09) vs frozen Dreamer WM (exp_11)
+
+defaults:
+  - exp_10_dreamer_encoder
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_11_frozen_dreamer_wm/tb"
+  video_dir: "experiments/exp_11_frozen_dreamer_wm/video"
+  checkpoint_folder: "experiments/exp_11_frozen_dreamer_wm/checkpoints"
+
+  world_model:
+    train_world_model: False
+    pretrained_wm_checkpoint: "experiments/exp_15_falcon_ratio_1/checkpoints/ckpt.17.pth"

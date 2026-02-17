@@ -1,0 +1,14 @@
+# @package _global_
+# 实验 4: Falcon WM - No Trajectory (消融实验 - 移除 Trajectory Prediction)
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_04_no_traj/tb"
+  video_dir: "experiments/exp_04_no_traj/video"
+  checkpoint_folder: "experiments/exp_04_no_traj/checkpoints"
+
+  world_model:
+    traj_loss_scale: 0.0  # 不使用 trajectory prediction

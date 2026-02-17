@@ -1,0 +1,21 @@
+# @package _global_
+# 实验 10: Dreamer Encoder (消融 - 使用 Dreamer CNN encoder 替代 Falcon ResNet encoder)
+# 目的: 对比 Dreamer encoder vs Falcon encoder 对 WM 性能的影响
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_10_dreamer_encoder/tb"
+  video_dir: "experiments/exp_10_dreamer_encoder/video"
+  checkpoint_folder: "experiments/exp_10_dreamer_encoder/checkpoints"
+
+  world_model:
+    encoder_type: dreamer
+    cnn_depth: 32
+    kernel_size: 4
+    minres: 4
+    # 覆盖 falcon 相关配置（不使用）
+    falcon_pretrained_path: null
+    freeze_wm_encoder: False  # Dreamer encoder 从头训练，不冻结

@@ -472,6 +472,7 @@ class WorldModelConfig(HabitatBaselinesBaseConfig):
     falcon_target_dim: int = 512
     falcon_pretrained_path: Optional[str] = None
     falcon_strict_load: bool = False
+    freeze_wm_encoder: bool = False  # 冻结 WM encoder，仅训练 RSSM + decoders
 
     # RSSM
     dyn_stoch: int = 30
@@ -490,6 +491,8 @@ class WorldModelConfig(HabitatBaselinesBaseConfig):
     pred_horizon: int = 5
     use_goal_conditioning: bool = True
     state_goal_dim: int = 8
+
+    pretrained_wm_checkpoint: Optional[str] = None
 
     # 训练策略
     wm_train_ratio: float = 0.1

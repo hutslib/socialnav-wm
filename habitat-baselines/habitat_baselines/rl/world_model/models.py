@@ -12,6 +12,7 @@
 # - 'dreamer': Dreamer-style CNN (default, designed for WM)
 # - 'falcon': Reuse Falcon's ResNet encoder (can use pretrained weights)
 
+import logging
 import numpy as np
 import torch
 from torch import nn
@@ -24,6 +25,8 @@ from habitat_baselines.rl.world_model.networks import (
 )
 from habitat_baselines.rl.world_model.falcon_encoder_adapter import FalconEncoderAdapter
 from habitat_baselines.rl.ddppo.policy.resnet import resnet18, resnet50
+
+logger = logging.getLogger(__name__)
 
 
 class SocialNavWorldModel(nn.Module):
@@ -48,7 +51,7 @@ class SocialNavWorldModel(nn.Module):
         
         if encoder_type == 'falcon':
             # Use Falcon's ResNet encoder with adapter
-            print("Using Falcon ResNet encoder (can reuse pretrained weights)")
+            logger.info("[World Model] Using Falcon ResNet encoder (can reuse pretrained weights)")
             
             if observation_space is None:
                 raise ValueError("observation_space is required for Falcon encoder")
@@ -71,15 +74,19 @@ class SocialNavWorldModel(nn.Module):
             )
 
             # Load pretrained Falcon weights if specified
-            if config.get('falcon_pretrained_path', None):
+            pretrained_path = config.get('falcon_pretrained_path', None)
+            if pretrained_path:
+                logger.info(f"[World Model] Loading pretrained Falcon encoder from: {pretrained_path}")
                 self.encoder.load_falcon_weights(
-                    config['falcon_pretrained_path'],
+                    pretrained_path,
                     strict=config.get('falcon_strict_load', False)
                 )
+            else:
+                logger.info("[World Model] No pretrained Falcon encoder path specified, training from scratch")
         
         elif encoder_type == 'dreamer':
             # Use Dreamer-style CNN encoder (default)
-            print("Using Dreamer-style CNN encoder")
+            logger.info("[World Model] Using Dreamer-style CNN encoder")
             
             if observation_space is not None:
                 self.encoder = SocialNavEncoder(
@@ -182,6 +189,25 @@ class SocialNavWorldModel(nn.Module):
             norm=config.get('norm', True),
             outscale=config.get('decoder_outscale', 1.0),
         )
+
+    def freeze_encoder(self):
+        """冻结 encoder 参数，仅训练 RSSM + decoders"""
+        frozen_count = 0
+        for param in self.encoder.parameters():
+            param.requires_grad_(False)
+            frozen_count += param.numel()
+        total_count = sum(p.numel() for p in self.parameters())
+        trainable_count = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(
+            f"[World Model] Froze WM encoder: "
+            f"{frozen_count:,} params frozen, "
+            f"{trainable_count:,} params trainable, "
+            f"{total_count:,} total"
+        )
+
+    def trainable_parameters(self):
+        """返回需要训练的参数（排除 frozen encoder）"""
+        return (p for p in self.parameters() if p.requires_grad)
 
     def get_feat(self, state):
         """

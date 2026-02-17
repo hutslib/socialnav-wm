@@ -1,0 +1,14 @@
+# @package _global_
+# 实验 8: Pretrained WM + ratio 1.0 (每次 PPO 都做 WM 训练)
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_08_pretrain_ratio_100/tb"
+  video_dir: "experiments/exp_08_pretrain_ratio_100/video"
+  checkpoint_folder: "experiments/exp_08_pretrain_ratio_100/checkpoints"
+
+  world_model:
+    pretrained_wm_checkpoint: "experiments/exp_02_full_wm/checkpoints/latest.pth"

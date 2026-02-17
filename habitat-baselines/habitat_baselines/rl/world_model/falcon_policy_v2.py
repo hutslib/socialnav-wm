@@ -296,14 +296,11 @@ class SocialNavWMNetV2(Net):
                 )
 
             elif wm_fusion_mode == "late":
-                # 后融合: WM 不进入 RNN 输入，只与 RNN 输出融合（RNN 输入仅 visual 等）
-                self.wm_feature_fc = nn.Sequential(
-                    nn.Linear(wm_feat_size, hidden_size, bias=False),
-                    nn.LayerNorm(hidden_size, eps=1e-03),
-                    nn.SiLU(),
-                )
-                self.wm_feature_fc.apply(tools.weight_init)
-                # 注意: late 模式不增加 rnn_input_size
+                # 后融合: WM 不进入 RNN 输入，两侧各自 LayerNorm 后 concat 给 actor/critic
+                self._wm_late_dim = wm_feat_size  # deter 原始维度 (200)
+                self.wm_late_ln = nn.LayerNorm(wm_feat_size, eps=1e-03)
+                self.rnn_out_ln = nn.LayerNorm(hidden_size, eps=1e-03)
+                # 不增加 rnn_input_size
 
             else:
                 # 不支持的 fusion mode，给出警告并回退
@@ -334,7 +331,10 @@ class SocialNavWMNetV2(Net):
 
     @property
     def output_size(self):
-        return self._hidden_size
+        base = self._hidden_size
+        if getattr(self, 'wm_fusion_mode', None) == "late" and self.use_world_model:
+            base += self._wm_late_dim
+        return base
 
     @property
     def is_blind(self):
@@ -408,11 +408,14 @@ class SocialNavWMNetV2(Net):
                     rssm_state = self.world_model.dynamics.initial(batch_size)
 
                 if use_cached_wm_feat:
-                    # Cached feature is raw RSSM feature from rollout storage.
-                    # Keep wm_feature_fc in PPO graph so policy-side WM fusion
-                    # layers are still trained during policy update.
                     wm_feat = cached_wm_feat.detach()
-                    wm_feat_processed = self.wm_feature_fc(wm_feat)
+                    # late 模式: LayerNorm 后直接用，其他模式经过 wm_feature_fc
+                    if self.wm_fusion_mode == "late":
+                        wm_feat_processed = self.wm_late_ln(wm_feat)
+                    else:
+                        # Keep wm_feature_fc in PPO graph so policy-side WM fusion
+                        # layers are still trained during policy update.
+                        wm_feat_processed = self.wm_feature_fc(wm_feat)
                 else:
                     # Encode with WM encoder
                     # WM is always decoupled from PPO loss.
@@ -458,7 +461,11 @@ class SocialNavWMNetV2(Net):
                     # Get WM feature: deter only (deterministic, stable for policy)
                     wm_feat = self.world_model.dynamics.get_deter_feat(rssm_state)
                     wm_feat = wm_feat.detach()
-                    wm_feat_processed = self.wm_feature_fc(wm_feat)
+                    # late 模式: LayerNorm 后直接用，其他模式经过 wm_feature_fc
+                    if self.wm_fusion_mode == "late":
+                        wm_feat_processed = self.wm_late_ln(wm_feat)
+                    else:
+                        wm_feat_processed = self.wm_feature_fc(wm_feat)
 
                 if use_persistent_rssm:
                     self.rssm_state = rssm_state
@@ -480,7 +487,7 @@ class SocialNavWMNetV2(Net):
                     fused, _ = self.fusion_attention(features, features, features)
                     x.append(fused.mean(dim=1))
                 elif self.wm_fusion_mode == "late":
-                    # 后融合: 只把 visual 送入 RNN，WM 在 RNN 输出后再加
+                    # 后融合: visual 送入 RNN，raw deter 在 RNN 输出后直接 concat
                     x.append(visual_feats)
                     wm_feat_for_late = wm_feat_processed
             else:
@@ -602,9 +609,9 @@ class SocialNavWMNetV2(Net):
             out, rnn_hidden_states, masks, rnn_build_seq_info
         )
         
-        # Late fusion: 如果使用后融合模式，在 RNN 输出后添加 WM 特征
+        # Late fusion: 两侧 LayerNorm 后 concat，一起送入 actor/critic
         if wm_feat_for_late is not None:
-            out = out + wm_feat_for_late
+            out = torch.cat([self.rnn_out_ln(out), wm_feat_for_late], dim=-1)
             
         aux_loss_state["rnn_output"] = out
 

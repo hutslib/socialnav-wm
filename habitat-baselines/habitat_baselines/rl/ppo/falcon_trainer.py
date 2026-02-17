@@ -435,6 +435,10 @@ class FalconTrainer(BaseRLTrainer):
         self.window_episode_stats = defaultdict(
             lambda: deque(maxlen=self._ppo_cfg.reward_window_size)
         )
+        self._resume_update_num = 0
+        # logger.info(f"[INIT DEBUG] running_episode_stats initialized with "
+        #              f"num_envs={self.envs.num_envs}, all zeros. "
+        #              f"window_size={self._ppo_cfg.reward_window_size}")
 
         # ==================== World Model Training Setup ====================
         self._init_world_model_training()
@@ -458,13 +462,11 @@ class FalconTrainer(BaseRLTrainer):
                 wm_config, "train_world_model", False
             )
 
-        if not self.use_world_model or not self.train_world_model:
-            logger.info("World Model training is disabled")
+        if not self.use_world_model:
+            logger.info("World Model is disabled")
             return
 
-        logger.info("Initializing World Model training...")
-
-        # Get WM from policy
+        # Get WM from policy (needed for both training and pretrained loading)
         try:
             if hasattr(self._agent.actor_critic, 'net'):
                 # Single agent
@@ -482,6 +484,23 @@ class FalconTrainer(BaseRLTrainer):
             self.train_world_model = False
             return
 
+        # Load pretrained World Model weights if specified
+        # (even when train_world_model=False, we still need to load pretrained weights for inference)
+        pretrained_wm_path = getattr(wm_config, "pretrained_wm_checkpoint", None)
+        if pretrained_wm_path is not None and pretrained_wm_path != "":
+            self._load_pretrained_world_model(pretrained_wm_path)
+
+        if not self.train_world_model:
+            logger.info("World Model training is disabled (pretrained WM loaded for inference only)")
+            return
+
+        logger.info("Initializing World Model training...")
+
+        # Freeze WM encoder if specified (after loading pretrained weights)
+        self.freeze_wm_encoder = getattr(wm_config, "freeze_wm_encoder", False)
+        if self.freeze_wm_encoder:
+            self.world_model.freeze_encoder()
+
         # WM training parameters (from config)
         self.wm_train_ratio = getattr(wm_config, "wm_train_ratio", 0.1)
         self.wm_warmup_updates = getattr(wm_config, "wm_warmup_updates", 1000)
@@ -497,9 +516,9 @@ class FalconTrainer(BaseRLTrainer):
         self.kl_loss_scale = getattr(wm_config, "kl_loss_scale", 0.1)
         self.kl_free_bits = getattr(wm_config, "kl_free_bits", 1.0)
 
-        # Create WM optimizer
+        # Create WM optimizer (only include trainable params, excludes frozen encoder)
         self.wm_optimizer = torch.optim.Adam(
-            self.world_model.parameters(),
+            self.world_model.trainable_parameters(),
             lr=getattr(wm_config, "wm_lr", 3e-4),
             eps=getattr(wm_config, "opt_eps", 1e-5),
             weight_decay=getattr(wm_config, "weight_decay", 0.0),
@@ -541,6 +560,7 @@ class FalconTrainer(BaseRLTrainer):
         logger.info(f"  - wm_train_ratio: {self.wm_train_ratio} (update every {int(1/self.wm_train_ratio)} policy updates)")
         logger.info(f"  - wm_warmup_updates: {self.wm_warmup_updates}")
         logger.info("  - wm_mode: decoupled (independent optimizer)")
+        logger.info(f"  - freeze_wm_encoder: {self.freeze_wm_encoder}")
         logger.info(f"  - replay_buffer_size: {buffer_size}")
         logger.info(f"  - wm_batch_size: {self.wm_batch_size}")
         logger.info(f"  - wm_sequence_length: {self.wm_sequence_length}")
@@ -563,6 +583,88 @@ class FalconTrainer(BaseRLTrainer):
             self.wm_optimizer.zero_grad(set_to_none=True)
         for param in self.world_model.parameters():
             param.grad = None
+
+    def _load_pretrained_world_model(self, checkpoint_path: str):
+        """加载预训练的 World Model 权重
+
+        Args:
+            checkpoint_path: 预训练checkpoint的路径（可以是完整checkpoint或只包含world_model的文件）
+        """
+        if not os.path.exists(checkpoint_path):
+            logger.warning(f"Pretrained WM checkpoint not found: {checkpoint_path}")
+            return
+
+        try:
+            if rank0_only():
+                logger.info(f"Loading pretrained World Model from: {checkpoint_path}")
+
+            # Load checkpoint
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+            # Extract world_model state_dict
+            wm_state_dict = None
+
+            # 情况1: checkpoint包含完整的agent state
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+                # 从state_dict中提取world_model的参数
+                wm_state_dict = {}
+                wm_prefix = 'actor_critic.net.world_model.'
+                for key, value in state_dict.items():
+                    if key.startswith(wm_prefix):
+                        # 移除前缀
+                        new_key = key[len(wm_prefix):]
+                        wm_state_dict[new_key] = value
+
+            # 情况2: checkpoint直接是world_model的state_dict
+            elif any(key.startswith(('encoder.', 'dynamics.', 'heads.')) for key in checkpoint.keys()):
+                wm_state_dict = checkpoint
+
+            # 情况3: checkpoint中有world_model字段
+            elif 'world_model' in checkpoint:
+                wm_state_dict = checkpoint['world_model']
+
+            if wm_state_dict is None or len(wm_state_dict) == 0:
+                logger.warning("No world_model parameters found in checkpoint")
+                return
+
+            # Load weights
+            missing_keys, unexpected_keys = self.world_model.load_state_dict(
+                wm_state_dict, strict=False
+            )
+
+            if rank0_only():
+                loaded_keys = [k for k in wm_state_dict if k not in missing_keys]
+                loaded_params = sum(wm_state_dict[k].numel() for k in loaded_keys)
+                total_params = sum(p.numel() for p in self.world_model.parameters())
+                logger.info(
+                    f"[World Model] Successfully loaded pretrained WM checkpoint!\n"
+                    f"  Source: {checkpoint_path}\n"
+                    f"  Loaded layers: {len(loaded_keys)}/{len(wm_state_dict)}\n"
+                    f"  Loaded params: {loaded_params:,} / {total_params:,} "
+                    f"({loaded_params/total_params*100:.1f}%)"
+                )
+                if missing_keys:
+                    logger.warning(
+                        f"  Missing keys ({len(missing_keys)}, will be randomly initialized):"
+                    )
+                    for key in missing_keys[:10]:
+                        logger.warning(f"    - {key}")
+                    if len(missing_keys) > 10:
+                        logger.warning(f"    ... and {len(missing_keys) - 10} more")
+                if unexpected_keys:
+                    logger.warning(
+                        f"  Unexpected keys ({len(unexpected_keys)}, ignored):"
+                    )
+                    for key in unexpected_keys[:10]:
+                        logger.warning(f"    - {key}")
+                    if len(unexpected_keys) > 10:
+                        logger.warning(f"    ... and {len(unexpected_keys) - 10} more")
+
+        except Exception as e:
+            logger.error(f"Failed to load pretrained World Model: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
 
     def _load_wm_state(self, resume_state):
         """从 checkpoint 加载 World Model optimizer 状态"""
@@ -1035,6 +1137,28 @@ class FalconTrainer(BaseRLTrainer):
                 done_masks, 0.0
             )
 
+            # ===== DEBUG: Episode completion diagnostics =====
+            # _n_done = done_masks.sum().item()
+            # _resume_n = getattr(self, '_resume_update_num', 0)
+            # _updates_since_resume = self.num_updates_done - _resume_n
+            # if _n_done > 0 and _updates_since_resume <= 5:
+            #     _spl_vals = extracted_infos.get("spl", [])
+            #     _success_vals = extracted_infos.get("success", [])
+            #     _dtg_vals = extracted_infos.get("distance_to_goal", [])
+            #     _done_indices = done_masks.squeeze(-1).nonzero(as_tuple=True)[0].tolist()
+            #     _done_spl = [x for i, x in enumerate(_spl_vals) if i < len(dones) and dones[i]]
+            #     _done_success = [x for i, x in enumerate(_success_vals) if i < len(dones) and dones[i]]
+            #     _done_dtg = [x for i, x in enumerate(_dtg_vals) if i < len(dones) and dones[i]]
+            #     logger.info(
+            #         f"[EPISODE DEBUG] update={self.num_updates_done} "
+            #         f"done_count={int(_n_done)}, "
+            #         f"spl: mean={sum(_done_spl)/max(len(_done_spl),1):.4f} "
+            #         f"vals={[f'{x:.3f}' for x in _done_spl[:8]]}, "
+            #         f"success: mean={sum(_done_success)/max(len(_done_success),1):.4f}, "
+            #         f"dtg: mean={sum(_done_dtg)/max(len(_done_dtg),1):.2f} "
+            #         f"vals={[f'{x:.1f}' for x in _done_dtg[:8]]}"
+            #     )
+
         # Key Modification between the trainer and the original ppo trainer
         if self._is_static_encoder:
             self._encoder = self._agent.actor_critic.visual_encoder
@@ -1145,14 +1269,49 @@ class FalconTrainer(BaseRLTrainer):
         self, losses: Dict[str, float], count_steps_delta: int
     ) -> Dict[str, float]:
         stats_ordering = sorted(self.running_episode_stats.keys())
-        stats = torch.stack(
+        stats_before_reduce = torch.stack(
             [self.running_episode_stats[k] for k in stats_ordering], 0
         )
 
-        stats = self._all_reduce(stats)
+        stats = self._all_reduce(stats_before_reduce)
 
         for i, k in enumerate(stats_ordering):
             self.window_episode_stats[k].append(stats[i].clone())
+
+        # ===== DEBUG: Coalesce diagnostics (commented out) =====
+        # _resume_n = getattr(self, '_resume_update_num', 0)
+        # _updates_since_resume = self.num_updates_done - _resume_n
+        # _debug_should_log = (
+        #     _updates_since_resume <= 5
+        #     or self.num_updates_done % 10 == 0
+        # )
+        # if _debug_should_log:
+        #     _debug_keys = ["count", "spl", "success", "reward", "distance_to_goal"]
+        #     if self._is_distributed:
+        #         _world_size = torch.distributed.get_world_size()
+        #     else:
+        #         _world_size = 1
+        #     logger.info(
+        #         f"[COALESCE DEBUG] update={self.num_updates_done} "
+        #         f"(+{_updates_since_resume} since resume) "
+        #         f"world_size={_world_size}, count_steps_delta={count_steps_delta}"
+        #     )
+        #     for k in _debug_keys:
+        #         _idx = stats_ordering.index(k) if k in stats_ordering else -1
+        #         if _idx < 0:
+        #             continue
+        #         _before = stats_before_reduce[_idx].sum().item()
+        #         _after = stats[_idx].sum().item()
+        #         v = self.window_episode_stats[k]
+        #         _prev_sum = v[-2].sum().item() if len(v) > 1 else 0
+        #         _this_increment = _after - _prev_sum
+        #         logger.info(
+        #             f"  {k}: local_sum={_before:.4f}, "
+        #             f"all_reduce_sum={_after:.4f}, "
+        #             f"prev_snapshot={_prev_sum:.4f}, "
+        #             f"increment={_this_increment:.4f}, "
+        #             f"window_len={len(v)}"
+        #         )
 
         if self._is_distributed:
             loss_name_ordering = sorted(losses.keys())
@@ -1194,12 +1353,6 @@ class FalconTrainer(BaseRLTrainer):
         }
         deltas["count"] = max(deltas["count"], 1.0)
 
-        writer.add_scalar(
-            "reward",
-            deltas["reward"] / deltas["count"],
-            self.num_steps_done,
-        )
-
         # Check to see if there are any metrics
         # that haven't been logged yet
         metrics = {
@@ -1207,6 +1360,33 @@ class FalconTrainer(BaseRLTrainer):
             for k, v in deltas.items()
             if k not in {"reward", "count"}
         }
+
+        # ===== FIX: Resume 后平滑过渡 =====
+        # resume 后窗口从小开始增长，早期完成的 episode 以失败居多，
+        # 导致指标比真实策略水平低。用旧窗口平均值做加权混合来平滑。
+        # 权重 alpha = 当前窗口大小 / 目标窗口大小，alpha 从 0 → 1。
+        # smoothed = alpha * raw + (1 - alpha) * old_avg
+        _old_avg = getattr(self, '_resume_old_window_avg', {})
+        _target_wsize = self._ppo_cfg.reward_window_size
+        _cur_wsize = len(self.window_episode_stats.get("count", []))
+        if _old_avg and _cur_wsize < _target_wsize:
+            _alpha = _cur_wsize / _target_wsize
+            for k in metrics:
+                if k in _old_avg:
+                    metrics[k] = _alpha * metrics[k] + (1 - _alpha) * _old_avg[k]
+            if "reward" in _old_avg:
+                _raw_reward = deltas["reward"] / deltas["count"]
+                _smoothed_reward = _alpha * _raw_reward + (1 - _alpha) * _old_avg["reward"]
+            else:
+                _smoothed_reward = deltas["reward"] / deltas["count"]
+        else:
+            _smoothed_reward = deltas["reward"] / deltas["count"]
+
+        writer.add_scalar(
+            "reward",
+            _smoothed_reward,
+            self.num_steps_done,
+        )
 
         for k, v in metrics.items():
             writer.add_scalar(f"metrics/{k}", v, self.num_steps_done)
@@ -1307,16 +1487,61 @@ class FalconTrainer(BaseRLTrainer):
             for k, v in sorted(losses.items()):
                 logger.info(f"    {k}: {v:.4f}")
 
-            logger.info(
-                "  --- 窗口指标 (window_size={}) ---".format(
-                    len(self.window_episode_stats["count"])
+            _is_smoothing = bool(_old_avg and _cur_wsize < _target_wsize)
+            if _is_smoothing:
+                logger.info(
+                    "  --- 窗口指标 (window_size={}, smoothing alpha={:.2f}) ---".format(
+                        _cur_wsize, _alpha
+                    )
                 )
-            )
+            else:
+                logger.info(
+                    "  --- 窗口指标 (window_size={}) ---".format(
+                        len(self.window_episode_stats["count"])
+                    )
+                )
             logger.info(f"    count: {deltas['count']:.4f}")
-            for k in sorted(deltas.keys()):
-                if k == "count":
-                    continue
-                logger.info(f"    {k}: {(deltas[k] / deltas['count']):.4f}")
+            for k in sorted(metrics.keys()):
+                _raw = deltas[k] / deltas["count"] if k in deltas else 0
+                if _is_smoothing and k in _old_avg:
+                    logger.info(f"    {k}: {metrics[k]:.4f} (raw={_raw:.4f}, old={_old_avg[k]:.4f})")
+                else:
+                    logger.info(f"    {k}: {metrics[k]:.4f}")
+
+            # ===== DEBUG: Window detail for key metrics (commented out) =====
+            # _debug_detail_keys = ["count", "spl", "success", "distance_to_goal", "reward"]
+            # _resume_n = getattr(self, '_resume_update_num', 0)
+            # _updates_since_resume = self.num_updates_done - _resume_n
+            # logger.info(f"  --- [DEBUG] 窗口详情 (update={self.num_updates_done}, "
+            #             f"+{_updates_since_resume} since resume) ---")
+            # for k in _debug_detail_keys:
+            #     if k in self.window_episode_stats:
+            #         v = self.window_episode_stats[k]
+            #         wlen = len(v)
+            #         first_sum = v[0].sum().item() if wlen > 0 else 0
+            #         last_sum = v[-1].sum().item() if wlen > 0 else 0
+            #         delta = (v[-1] - v[0]).sum().item() if wlen > 1 else (v[0].sum().item() if wlen > 0 else 0)
+            #         last_incr = (v[-1] - v[-2]).sum().item() if wlen > 1 else 0
+            #         logger.info(
+            #             f"    {k}: wlen={wlen}, "
+            #             f"first={first_sum:.4f}, last={last_sum:.4f}, "
+            #             f"delta={delta:.4f}, "
+            #             f"last_incr={last_incr:.4f}, "
+            #             f"avg={delta / max(deltas['count'], 1.0):.4f}"
+            #         )
+            #         if wlen <= 6:
+            #             all_sums = [vi.sum().item() for vi in v]
+            #             logger.info(f"      all_snapshots: {[f'{s:.2f}' for s in all_sums]}")
+            #         elif wlen <= 10:
+            #             all_sums = [vi.sum().item() for vi in v]
+            #             logger.info(f"      snapshots: {[f'{s:.1f}' for s in all_sums]}")
+            #         else:
+            #             head_sums = [v[j].sum().item() for j in range(3)]
+            #             tail_sums = [v[j].sum().item() for j in range(wlen-3, wlen)]
+            #             logger.info(
+            #                 f"      first_3: {[f'{s:.2f}' for s in head_sums]}, "
+            #                 f"last_3: {[f'{s:.2f}' for s in tail_sums]}"
+            #             )
 
             logger.info("  --- Perf (mean) ---")
             for k, v in g_timer.items():
@@ -1384,11 +1609,52 @@ class FalconTrainer(BaseRLTrainer):
             count_checkpoints = requeue_stats["count_checkpoints"]
             prev_time = requeue_stats["prev_time"]
 
-            self.running_episode_stats = requeue_stats["running_episode_stats"]
-            self.window_episode_stats.update(
-                requeue_stats["window_episode_stats"]
-            )
+            # ===== FIX: Resume 后窗口指标连续性修复 =====
+            # 不恢复 running_episode_stats 和 window_episode_stats。
+            # 原因：resume 后环境被完全重建，所有 episode 从头开始，
+            # running_episode_stats 的旧累计值与新环境状态不匹配。
+            # 让两者都保持 _init_train 中初始化的零值，与从头训练一致。
+            # 这样窗口指标忠实反映 resume 后的真实策略表现。
+            #
+            # 注意：不恢复 running_episode_stats 意味着旧累计数据丢失，
+            # 但窗口指标只关心增量（v[-1] - v[0]），不依赖历史绝对值。
+            # logger.info("[RESUME] NOT restoring running_episode_stats and "
+            #             "window_episode_stats (reset to zeros, consistent with "
+            #             "newly rebuilt environments)")
+
+            # 保存旧窗口平均值用于平滑过渡
+            _old_window = requeue_stats.get("window_episode_stats", {})
+            _old_window_len = len(next(iter(_old_window.values()), []))
+            self._resume_old_window_avg = {}
+            if _old_window_len > 1 and "count" in _old_window:
+                _old_count_delta = (_old_window['count'][-1] - _old_window['count'][0]).sum().item()
+                if _old_count_delta > 0:
+                    for _ok, _ov in _old_window.items():
+                        if _ok == "count":
+                            continue
+                        _ov_delta = (_ov[-1] - _ov[0]).sum().item()
+                        self._resume_old_window_avg[_ok] = _ov_delta / _old_count_delta
+                # logger.info(f"[RESUME] Old window averages (for reference, {_old_window_len} snapshots):")
+                # for _ok in ["count", "spl", "success", "reward", "distance_to_goal"]:
+                #     if _ok in self._resume_old_window_avg:
+                #         logger.info(f"  {_ok}: {self._resume_old_window_avg[_ok]:.4f}")
+                #     elif _ok == "count":
+                #         logger.info(f"  count: delta={_old_count_delta:.0f}")
+
             resume_run_id = requeue_stats.get("run_id", None)
+
+            self._resume_update_num = self.num_updates_done
+
+            # ===== DEBUG: Resume diagnostics (commented out) =====
+            # logger.info("=" * 70)
+            # logger.info(f"[RESUME DEBUG] num_updates_done={self.num_updates_done}, "
+            #             f"num_steps_done={self.num_steps_done}, "
+            #             f"num_envs={self.envs.num_envs}, "
+            #             f"is_distributed={self._is_distributed}")
+            # logger.info("[RESUME DEBUG] running_episode_stats: reset to zeros "
+            #             f"(num_envs={self.envs.num_envs})")
+            # logger.info("[RESUME DEBUG] window_episode_stats: empty")
+            # logger.info("=" * 70)
 
         with (
             get_writer(

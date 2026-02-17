@@ -1,0 +1,16 @@
+# @package _global_
+# 实验 7: Pretrained WM + ratio 0.015625 (每 64 次 PPO 做 1 次 WM)
+
+defaults:
+  - exp_02_full_wm
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_07_pretrain_ratio_001/tb"
+  video_dir: "experiments/exp_07_pretrain_ratio_001/video"
+  checkpoint_folder: "experiments/exp_07_pretrain_ratio_001/checkpoints"
+
+  world_model:
+    wm_train_ratio: 0.015625
+    wm_epochs_per_update: 966
+    pretrained_wm_checkpoint: "experiments/exp_02_full_wm/checkpoints/latest.pth"

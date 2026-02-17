@@ -19,6 +19,7 @@
 #   Part 3: Human Trajectory (WM扩展)
 #   Part 4: Start/Goal (WM扩展)
 
+import logging
 import numpy as np
 import torch
 from torch import nn
@@ -29,6 +30,8 @@ from habitat_baselines.rl.world_model.networks import (
     FUSE_KEYS_1D_DEFAULT,
     HUMAN_STATE_GOAL_KEYS_DEFAULT,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class FalconEncoderAdapter(nn.Module):
@@ -164,11 +167,11 @@ class FalconEncoderAdapter(nn.Module):
         # Total output dimension
         self.outdim = visual_outdim + sensor_outdim + hs_outdim
 
-        print(f"FalconEncoderAdapter initialized:")
-        print(f"  - Visual: {visual_outdim} (from Falcon ResNet)")
-        print(f"  - 1D Sensors: {sensor_outdim} (pointgoal + human_num)")
-        print(f"  - Human state+goal: {hs_outdim}")
-        print(f"  - Total: {self.outdim}")
+        logger.info("FalconEncoderAdapter initialized:")
+        logger.info(f"  - Visual: {visual_outdim} (from Falcon ResNet)")
+        logger.info(f"  - 1D Sensors: {sensor_outdim} (pointgoal + human_num)")
+        logger.info(f"  - Human state+goal: {hs_outdim}")
+        logger.info(f"  - Total: {self.outdim}")
 
     @property
     def is_blind(self):
@@ -238,7 +241,7 @@ class FalconEncoderAdapter(nn.Module):
             checkpoint_path: Path to Falcon checkpoint
             strict: Whether to strictly enforce state dict matching
         """
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
         # Extract visual encoder weights
         visual_state_dict = {}
@@ -250,7 +253,7 @@ class FalconEncoderAdapter(nn.Module):
                 visual_state_dict[new_key] = v
 
         if len(visual_state_dict) == 0:
-            print(f"Warning: No visual encoder weights found in {checkpoint_path}")
+            logger.warning(f"No visual encoder weights found in {checkpoint_path}")
             return
 
         # Load weights
@@ -258,9 +261,18 @@ class FalconEncoderAdapter(nn.Module):
             visual_state_dict, strict=strict
         )
 
-        if len(missing_keys) > 0:
-            print(f"Missing keys: {missing_keys}")
-        if len(unexpected_keys) > 0:
-            print(f"Unexpected keys: {unexpected_keys}")
+        loaded_count = len(visual_state_dict) - len(missing_keys)
+        total_params = sum(p.numel() for p in self.visual_encoder.parameters())
+        loaded_params = sum(visual_state_dict[k].numel() for k in visual_state_dict if k not in missing_keys)
 
-        print(f"✅ Loaded Falcon visual encoder weights from {checkpoint_path}")
+        if len(missing_keys) > 0:
+            logger.warning(f"WM Falcon encoder: missing keys ({len(missing_keys)}): {missing_keys}")
+        if len(unexpected_keys) > 0:
+            logger.warning(f"WM Falcon encoder: unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
+
+        logger.info(
+            f"[World Model] Successfully loaded pretrained Falcon encoder weights!\n"
+            f"  Source: {checkpoint_path}\n"
+            f"  Loaded layers: {loaded_count}/{len(visual_state_dict)}\n"
+            f"  Loaded params: {loaded_params:,} / {total_params:,} ({loaded_params/total_params*100:.1f}%)"
+        )

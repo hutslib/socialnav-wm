@@ -1,6 +1,5 @@
 # @package _global_
-# 实验 1: base falcon (Falcon Baseline, 无 World Model)
-# 目的: 建立性能基准
+# 实验 1: Falcon Baseline (无 World Model, 无辅助损失)
 
 defaults:
   - /benchmark/nav/socialnav_v2: falcon_hm3d_task_for_train
@@ -94,16 +93,16 @@ habitat_baselines:
   verbose: True
   trainer_name: "falcon_trainer"
   torch_gpu_id: 0
-  tensorboard_dir: "experiments/exp_01_baseline_falcon/tb"
-  video_dir: "experiments/exp_01_baseline_falcon/video"
-  checkpoint_folder: "experiments/exp_01_baseline_falcon/checkpoints"
+  tensorboard_dir: "experiments/exp_01_baseline/tb"
+  video_dir: "experiments/exp_01_baseline/video"
+  checkpoint_folder: "experiments/exp_01_baseline/checkpoints"
   test_episode_count: -1
   num_environments: 28
   num_updates: -1
   total_num_steps: 15000000
   log_interval: 2
-  num_checkpoints: -1 # use checkpoint_interval instead of percent-based saving
-  checkpoint_interval: 20 # save ckpt every 20 updates
+  num_checkpoints: -1
+  checkpoint_interval: 20
   force_torch_single_threaded: True
   load_resume_state_config: True
 
@@ -160,14 +159,4 @@ habitat_baselines:
       num_recurrent_layers: 2
 
     auxiliary_losses:
-      people_counting:
-        max_human_num: 6
-        loss_scale: 0.1
-      guess_human_position:
-        max_human_num: 6
-        position_dim: 2
-        loss_scale: 0.1
-      future_trajectory_prediction:
-        max_human_num: 6
-        future_step: 4
-        loss_scale: 0.1
+      _delete_: true  # 强制清空，防止 Hydra 深度合并保留上层的 aux loss
