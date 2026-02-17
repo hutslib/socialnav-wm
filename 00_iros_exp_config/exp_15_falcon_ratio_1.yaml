@@ -6,9 +6,9 @@ defaults:
   - _self_
 
 habitat_baselines:
-  tensorboard_dir: "experiments/exp_11_falcon_ratio_004/tb"
-  video_dir: "experiments/exp_11_falcon_ratio_004/video"
-  checkpoint_folder: "experiments/exp_11_falcon_ratio_004/checkpoints"
+  tensorboard_dir: "experiments/exp_15_falcon_ratio_1/tb"
+  video_dir: "experiments/exp_15_falcon_ratio_1/video"
+  checkpoint_folder: "experiments/exp_15_falcon_ratio_1/checkpoints"
 
   world_model:
     fusion_mode: late  # 后融合 + deter feature（deter 在代码中已默认）

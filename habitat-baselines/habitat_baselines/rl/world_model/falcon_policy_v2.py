@@ -260,18 +260,8 @@ class SocialNavWMNetV2(Net):
         if use_world_model and world_model is not None:
             self.world_model = world_model
 
-            # WM feature dimension
-            if world_model._config.get('dyn_discrete', 32):
-                wm_feat_size = (
-                    world_model._config.get('dyn_stoch', 30) *
-                    world_model._config.get('dyn_discrete', 32) +
-                    world_model._config.get('dyn_deter', 200)
-                )
-            else:
-                wm_feat_size = (
-                    world_model._config.get('dyn_stoch', 30) +
-                    world_model._config.get('dyn_deter', 200)
-                )
+            # WM feature dimension: use deter only (same as WMP), for stable policy input
+            wm_feat_size = world_model._config.get('dyn_deter', 200)
 
             # WM feature fusion
             if wm_fusion_mode == "concat":
@@ -305,7 +295,30 @@ class SocialNavWMNetV2(Net):
                     batch_first=True,
                 )
 
-            self.rssm_state = None
+            elif wm_fusion_mode == "late":
+                # 后融合: WM 不进入 RNN 输入，只与 RNN 输出融合（RNN 输入仅 visual 等）
+                self.wm_feature_fc = nn.Sequential(
+                    nn.Linear(wm_feat_size, hidden_size, bias=False),
+                    nn.LayerNorm(hidden_size, eps=1e-03),
+                    nn.SiLU(),
+                )
+                self.wm_feature_fc.apply(tools.weight_init)
+                # 注意: late 模式不增加 rnn_input_size
+
+            else:
+                # 不支持的 fusion mode，给出警告并回退
+                import warnings
+                warnings.warn(
+                    f"Unsupported wm_fusion_mode: {wm_fusion_mode}. "
+                    f"Supported modes are: 'concat', 'add', 'attention', 'late'. "
+                    f"Falling back to pure Falcon mode (no World Model)."
+                )
+                self.use_world_model = False
+                self.world_model = None
+
+            # 只有在真正使用 WM 时才初始化 rssm_state
+            if self.use_world_model:
+                self.rssm_state = None
         else:
             self.world_model = None
         # ==================== 继续Falcon原始代码 ====================
@@ -350,6 +363,7 @@ class SocialNavWMNetV2(Net):
         # ==================== 完全复用Falcon代码顺序 ====================
         x = []
         aux_loss_state = {}
+        wm_feat_for_late = None  # 后融合时在 RNN 之后与 out 融合
         if not self.is_blind:
             # We CANNOT use observations.get() here because self.visual_encoder(observations)
             # is an expensive operation. Therefore, we need `# noqa: SIM401`
@@ -441,8 +455,8 @@ class SocialNavWMNetV2(Net):
                                 rssm_state, action_one_hot
                             )
 
-                    # Get WM feature
-                    wm_feat = self.world_model.dynamics.get_feat(rssm_state)
+                    # Get WM feature: deter only (deterministic, stable for policy)
+                    wm_feat = self.world_model.dynamics.get_deter_feat(rssm_state)
                     wm_feat = wm_feat.detach()
                     wm_feat_processed = self.wm_feature_fc(wm_feat)
 
@@ -465,6 +479,10 @@ class SocialNavWMNetV2(Net):
                     features = torch.stack([visual_feats, wm_feat_processed], dim=1)
                     fused, _ = self.fusion_attention(features, features, features)
                     x.append(fused.mean(dim=1))
+                elif self.wm_fusion_mode == "late":
+                    # 后融合: 只把 visual 送入 RNN，WM 在 RNN 输出后再加
+                    x.append(visual_feats)
+                    wm_feat_for_late = wm_feat_processed
             else:
                 # 不使用WM，直接使用Falcon visual features
                 x.append(visual_feats)
@@ -583,6 +601,11 @@ class SocialNavWMNetV2(Net):
         out, rnn_hidden_states = self.state_encoder(
             out, rnn_hidden_states, masks, rnn_build_seq_info
         )
+        
+        # Late fusion: 如果使用后融合模式，在 RNN 输出后添加 WM 特征
+        if wm_feat_for_late is not None:
+            out = out + wm_feat_for_late
+            
         aux_loss_state["rnn_output"] = out
 
         return out, rnn_hidden_states, aux_loss_state
