@@ -598,33 +598,27 @@ class FalconTrainer(BaseRLTrainer):
             if rank0_only():
                 logger.info(f"Loading pretrained World Model from: {checkpoint_path}")
 
-            # Load checkpoint
+            # Load checkpoint（与 save_checkpoint 一致：单 agent 为 state_dict，多 agent 为 {0: {state_dict}, 1: {...}}）
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            state_dict = checkpoint.get("state_dict")
+            if state_dict is None:
+                for v in checkpoint.values():
+                    if isinstance(v, dict) and "state_dict" in v:
+                        state_dict = v["state_dict"]
+                        break
+            # state_dict 来自 policy.state_dict()，key 为 "net.world_model.xxx"（单 agent）或带 "module."（DDP）
+            wm_prefixes = ("net.world_model.", "module.net.world_model.")
+            wm_state_dict = {}
+            if state_dict:
+                for k, v in state_dict.items():
+                    if not isinstance(k, str):
+                        continue
+                    for prefix in wm_prefixes:
+                        if k.startswith(prefix):
+                            wm_state_dict[k[len(prefix):]] = v
+                            break
 
-            # Extract world_model state_dict
-            wm_state_dict = None
-
-            # 情况1: checkpoint包含完整的agent state
-            if 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-                # 从state_dict中提取world_model的参数
-                wm_state_dict = {}
-                wm_prefix = 'actor_critic.net.world_model.'
-                for key, value in state_dict.items():
-                    if key.startswith(wm_prefix):
-                        # 移除前缀
-                        new_key = key[len(wm_prefix):]
-                        wm_state_dict[new_key] = value
-
-            # 情况2: checkpoint直接是world_model的state_dict
-            elif any(key.startswith(('encoder.', 'dynamics.', 'heads.')) for key in checkpoint.keys()):
-                wm_state_dict = checkpoint
-
-            # 情况3: checkpoint中有world_model字段
-            elif 'world_model' in checkpoint:
-                wm_state_dict = checkpoint['world_model']
-
-            if wm_state_dict is None or len(wm_state_dict) == 0:
+            if not wm_state_dict:
                 logger.warning("No world_model parameters found in checkpoint")
                 return
 
