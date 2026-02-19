@@ -19,6 +19,7 @@ from habitat_baselines.config.default_structured_configs import (
 )
 from hydra.core.config_search_path import ConfigSearchPath
 from hydra.plugins.search_path_plugin import SearchPathPlugin
+from omegaconf import OmegaConf, read_write
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -39,6 +40,12 @@ register_hydra_plugin(HabitatConfigPlugin)
 )
 def main(cfg: "DictConfig"):
     cfg = patch_config(cfg)
+    if OmegaConf.select(cfg, "no_aux_loss") is True:
+        rl_node = OmegaConf.select(cfg, "habitat_baselines.rl")
+        with read_write(rl_node):
+            OmegaConf.update(
+                cfg, "habitat_baselines.rl.auxiliary_losses", {}, merge=False
+            )
     execute_exp(cfg, "eval" if cfg.habitat_baselines.evaluate else "train")
 
 

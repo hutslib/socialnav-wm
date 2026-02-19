@@ -220,7 +220,7 @@ habitat_baselines:
     wm_epochs_per_update: 15  # 每次 WM 更新训 10 个 batch
 
     # Replay buffer
-    replay_buffer_size: 50000
+    replay_buffer_size: 20000
     replay_buffer_warmup: 5000
 
     # Loss 权重

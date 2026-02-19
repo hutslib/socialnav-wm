@@ -1,5 +1,7 @@
 # @package _global_
 # 实验 1: Falcon Baseline (无 World Model, 无辅助损失)
+# 通过 no_aux_loss: true 在 run.py 中强制清空 auxiliary_losses（避免 Hydra 深度合并/恢复 config 仍带 aux）
+no_aux_loss: true
 
 defaults:
   - /benchmark/nav/socialnav_v2: falcon_hm3d_task_for_train
@@ -158,5 +160,4 @@ habitat_baselines:
       rnn_type: LSTM
       num_recurrent_layers: 2
 
-    auxiliary_losses:
-      _delete_: true  # 强制清空，防止 Hydra 深度合并保留上层的 aux loss
+    auxiliary_losses: {}  # 由 no_aux_loss + run.py 强制清空
