@@ -96,9 +96,9 @@ habitat_baselines:
   verbose: True
   trainer_name: "falcon_trainer"
   torch_gpu_id: 0
-  tensorboard_dir: "experiments/exp_02_full_wm/tb"
-  video_dir: "experiments/exp_02_full_wm/video"
-  checkpoint_folder: "experiments/exp_02_full_wm/checkpoints"
+  tensorboard_dir: "experiments/exp_02_full_wm_v2/tb"
+  video_dir: "experiments/exp_02_full_wm_v2/video"
+  checkpoint_folder: "experiments/exp_02_full_wm_v2/checkpoints"
   test_episode_count: -1
   num_environments: 28
   num_updates: -1
@@ -202,9 +202,10 @@ habitat_baselines:
     act: SiLU
     norm: True
     num_humans: 6
-    pred_horizon: 5
+    pred_horizon: 4
     use_goal_conditioning: True
     state_goal_dim: 8
+    residual: True  # 残差预测: 网络输出 delta, 最终 = anchor_pos + delta
 
     # 训练策略
     wm_train_ratio: 1.0
@@ -217,15 +218,15 @@ habitat_baselines:
     weight_decay: 0.0
     wm_batch_size: 16
     wm_sequence_length: 50
-    wm_epochs_per_update: 15  # 每次 WM 更新训 10 个 batch
+    wm_epochs_per_update: 15  # 每次 WM 更新训 15 个 batch
 
     # Replay buffer
     replay_buffer_size: 20000
     replay_buffer_warmup: 5000
 
     # Loss 权重
-    depth_loss_scale: 0.05
-    traj_loss_scale: 1.0
+    depth_loss_scale: 10.0
+    traj_loss_scale: 0.01
     reward_loss_scale: 1.0
     kl_loss_scale: 0.1
     kl_free_bits: 1.0

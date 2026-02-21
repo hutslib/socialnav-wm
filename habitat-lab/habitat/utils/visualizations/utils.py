@@ -229,6 +229,8 @@ def observations_to_image(observation: Dict, info: Dict) -> np.ndarray:
             continue
         elif 'oracle_shortest_path_sensor' in sensor_name or 'human_velocity_sensor' in sensor_name:
             continue
+        elif 'human_state_goal' in sensor_name or 'human_num' in sensor_name:
+            continue
         elif sensor_name.startswith('agent_') and int(sensor_name.split('_')[1]) > 0: # 1 for agent_1
             continue
         elif len(observation[sensor_name].shape) > 1:

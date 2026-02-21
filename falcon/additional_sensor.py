@@ -69,7 +69,7 @@ class SocialCompassSensorConfig(LabSensorConfig):
 @dataclass
 class OracleHumanoidFutureTrajectorySensorConfig(LabSensorConfig):
     type: str = "OracleHumanoidFutureTrajectorySensor"
-    future_step: int = 5
+    future_step: int = 4
 
 @registry.register_sensor(name="OracleShortestPathSensor")
 class OracleShortestPathSensor(Sensor):
@@ -417,20 +417,31 @@ class OracleHumanoidFutureTrajectorySensor(UsesArticulatedAgentInterface, Sensor
         if self.result_list is None or human_num != self.human_num:
             self.result_list = self._initialize_result_list(human_num, self.future_step, self.max_human_num)
             self.human_num = human_num
-        
+
+        self.result_list[:] = -100
+
         if self.human_num == 0:
             return self.result_list
-        
+
         human_future_trajectory = task.measurements.measures.get("human_future_trajectory")._metric
         if not human_future_trajectory:
             return self.result_list
 
         robot_pos = np.array(self._sim.get_agent_data(0).articulated_agent.base_pos)[[0, 2]]
 
-        for key, trajectories in human_future_trajectory.items():
-            trajectories = np.array(trajectories)
-            trajectories = trajectories.astype('float32')
-            self.result_list[key - 1, :len(trajectories), :] = (trajectories[:, [0, 2]] - robot_pos)
+        for key, wp_list in human_future_trajectory.items():
+            next_wp = np.array(wp_list[0], dtype=np.float32)
+            next_wp_2d = next_wp[[0, 2]]
+
+            human_pos = np.array(
+                self._sim.get_agent_data(key).articulated_agent.base_pos
+            )[[0, 2]]
+
+            n_seg = self.future_step
+            for s in range(n_seg):
+                alpha = (s + 1) / n_seg
+                interp = human_pos + alpha * (next_wp_2d - human_pos)
+                self.result_list[key - 1, s, :] = interp - robot_pos
 
         return self.result_list.tolist()
 
@@ -571,17 +582,21 @@ class HumanStateGoalSensor(UsesArticulatedAgentInterface, Sensor):
                 # 3. 朝向角度
                 rotation = float(human.base_rot)
                 
-                # 4. 目标位置 (相对机器人)
-                goal_pos = self._get_human_goal_position(i)
-                if goal_pos is not None:
-                    goal_pos_2d = np.array(goal_pos)[[0, 2]]
-                    goal_relative = goal_pos_2d - robot_pos
-                    
-                    # 5. 到目标的距离
-                    dist_to_goal = np.linalg.norm(goal_pos_2d - human_pos)
+                # 4. 目标位置 = 下一个路径点 (相对机器人)
+                next_wp = self._get_next_waypoint(i, task)
+                if next_wp is not None:
+                    next_wp_2d = np.array(next_wp)[[0, 2]]
+                    goal_relative = next_wp_2d - robot_pos
+                    dist_to_goal = np.linalg.norm(next_wp_2d - human_pos)
                 else:
-                    goal_relative = np.array([0.0, 0.0])
-                    dist_to_goal = 0.0
+                    goal_pos = self._get_human_goal_position(i)
+                    if goal_pos is not None:
+                        goal_pos_2d = np.array(goal_pos)[[0, 2]]
+                        goal_relative = goal_pos_2d - robot_pos
+                        dist_to_goal = np.linalg.norm(goal_pos_2d - human_pos)
+                    else:
+                        goal_relative = np.array([0.0, 0.0])
+                        dist_to_goal = 0.0
                 
                 # 组装特征向量
                 result[i-1] = [
@@ -600,6 +615,21 @@ class HumanStateGoalSensor(UsesArticulatedAgentInterface, Sensor):
         
         return result
     
+    def _get_next_waypoint(self, agent_idx, task):
+        """从 human_future_trajectory measurement 获取下一个路径点 (3D)。"""
+        try:
+            if hasattr(task, 'measurements') and hasattr(task.measurements, 'measures'):
+                measure = task.measurements.measures.get('human_future_trajectory')
+                if measure is not None:
+                    metric = measure._metric
+                    if agent_idx in metric:
+                        wp_list = metric[agent_idx]
+                        if wp_list and len(wp_list) > 0:
+                            return np.array(wp_list[0], dtype=np.float32)
+        except Exception:
+            pass
+        return None
+
     def _get_human_velocity(self, agent_idx, task):
         """获取人类的速度信息"""
         try:

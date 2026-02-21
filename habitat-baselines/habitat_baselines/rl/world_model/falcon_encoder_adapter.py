@@ -167,8 +167,15 @@ class FalconEncoderAdapter(nn.Module):
         # Total output dimension
         self.outdim = visual_outdim + sensor_outdim + hs_outdim
 
+        # Cached multi-scale feature maps for depth decoder U-Net skip connections
+        # layer1: (128, 32, 32), layer2: (256, 16, 16),
+        # layer3: (512, 8, 8),   compression: (128, 4, 4)
+        self._cached_visual_feats_ms = None
+        self.visual_feat_2d_shape = (C, H, W) if not self.visual_encoder.is_blind else None
+
         logger.info("FalconEncoderAdapter initialized:")
         logger.info(f"  - Visual: {visual_outdim} (from Falcon ResNet)")
+        logger.info(f"  - Visual 2D (final): {self.visual_feat_2d_shape}")
         logger.info(f"  - 1D Sensors: {sensor_outdim} (pointgoal + human_num)")
         logger.info(f"  - Human state+goal: {hs_outdim}")
         logger.info(f"  - Total: {self.outdim}")
@@ -199,14 +206,37 @@ class FalconEncoderAdapter(nn.Module):
 
 
         if not self.is_blind:
-            # 调用 Falcon encoder
-            x = self.visual_encoder(observations)  # (batch, C, H, W)
+            ve = self.visual_encoder
 
-            # WM扩展：全局池化将2D特征转为1D
-            # (替代Falcon中后续的flatten操作)
-            x = torch.mean(x, dim=[2, 3])  # (batch, C)
+            # Replicate ResNetEncoder.forward() but capture intermediate features
+            cnn_input = []
+            for k in ve.visual_keys:
+                obs_k = observations[k]
+                obs_k = obs_k.permute(0, 3, 1, 2)
+                if ve.key_needs_rescaling[k] is not None:
+                    obs_k = obs_k.float() * ve.key_needs_rescaling[k]
+                cnn_input.append(obs_k)
 
-            # WM扩展：可选投影层
+            vis = torch.cat(cnn_input, dim=1)
+            vis = torch.nn.functional.avg_pool2d(vis, 2)
+            vis = ve.running_mean_and_var(vis)
+
+            backbone = ve.backbone
+            vis = backbone.conv1(vis)
+            vis = backbone.maxpool(vis)
+            f1 = backbone.layer1(vis)    # (B, 128, 32, 32)
+            f2 = backbone.layer2(f1)     # (B, 256, 16, 16)
+            f3 = backbone.layer3(f2)     # (B, 512,  8,  8)
+            f4 = backbone.layer4(f3)     # (B, 1024, 4,  4)
+            feat_2d = ve.compression(f4) # (B, 128,  4,  4)
+
+            # Cache multi-scale features: ordered from coarse to fine
+            # so decoder (4→8→16→32→...) can pop them in order
+            self._cached_visual_feats_ms = [feat_2d, f3, f2, f1]
+
+            # Global pool → 1D for RSSM
+            x = torch.mean(feat_2d, dim=[2, 3])  # (batch, C)
+
             if self.visual_projection is not None:
                 x = self.visual_projection(x)
 

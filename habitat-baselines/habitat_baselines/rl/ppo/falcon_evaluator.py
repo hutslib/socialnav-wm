@@ -25,6 +25,7 @@ from habitat_baselines.utils.common import (
     is_continuous_action_space,
 )
 from habitat_baselines.utils.info_dict import extract_scalars_from_info
+from habitat_baselines.utils.wm_visualizer import WMVisualizer
 
 import json
 
@@ -99,6 +100,32 @@ class FALCONEvaluator(Evaluator):
             ]
         else:
             rgb_frames = None
+
+        # ── World Model visualisation ──
+        # Locate the world_model from the policy network.
+        # In multi-agent setup: agent._agents[0]._actor_critic.net.world_model
+        # In single-agent:      agent.actor_critic.net.world_model
+        # MultiPolicy wrapper:  agent.actor_critic._active_policies[0].net.world_model
+        wm_obj = None
+        for candidate in [
+            getattr(agent, "actor_critic", None),
+            getattr(getattr(agent, "actor_critic", None), "_active_policies", [None])[0]
+            if hasattr(getattr(agent, "actor_critic", None), "_active_policies") else None,
+            getattr(agent._agents[0], "_actor_critic", None) if hasattr(agent, "_agents") else None,
+        ]:
+            _net = getattr(candidate, "net", None) if candidate is not None else None
+            if _net is not None and hasattr(_net, "world_model") and _net.world_model is not None:
+                wm_obj = _net.world_model
+                break
+        has_wm = wm_obj is not None and len(config.habitat_baselines.eval.video_option) > 0
+        if has_wm:
+            wm_vis = WMVisualizer(wm_obj, device, config.habitat_baselines.num_environments)
+            wm_frames: List[List[np.ndarray]] = [
+                [] for _ in range(config.habitat_baselines.num_environments)
+            ]
+        else:
+            wm_vis = None
+            wm_frames = None
 
         if len(config.habitat_baselines.eval.video_option) > 0:
             os.makedirs(config.habitat_baselines.video_dir, exist_ok=True)
@@ -221,6 +248,13 @@ class FALCONEvaluator(Evaluator):
             )
             batch = apply_obs_transforms_batch(batch, obs_transforms)  # type: ignore
 
+            # ── Collect WM visualisation frames ──
+            if wm_vis is not None:
+                for i in range(envs.num_envs):
+                    wm_frame = wm_vis.step(batch, prev_actions, not_done_masks, i)
+                    if wm_frame is not None:
+                        wm_frames[i].append(wm_frame)
+
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
                 dtype=torch.bool,
@@ -309,6 +343,23 @@ class FALCONEvaluator(Evaluator):
                             keys_to_include_in_name=config.habitat_baselines.eval_keys_to_include_in_name,
                         )
 
+                        # ── Save WM visualisation video ──
+                        if wm_vis is not None and len(wm_frames[i]) > 0:
+                            generate_video(
+                                video_option=config.habitat_baselines.eval.video_option,
+                                video_dir=config.habitat_baselines.video_dir,
+                                images=wm_frames[i],
+                                scene_id=f"{current_episodes_info[i].scene_id}".split('/')[-1].split('.')[0],
+                                episode_id=f"{current_episodes_info[i].episode_id}_{ep_eval_count[k]}_wm",
+                                checkpoint_idx=checkpoint_index,
+                                metrics=extract_scalars_from_info(disp_info),
+                                fps=config.habitat_baselines.video_fps,
+                                tb_writer=writer,
+                                keys_to_include_in_name=config.habitat_baselines.eval_keys_to_include_in_name,
+                            )
+                            wm_frames[i] = []
+                            wm_vis.reset_env(i)
+
                         # Since the starting frame of the next episode is the final frame.
                         rgb_frames[i] = rgb_frames[i][-1:]
 
@@ -339,6 +390,13 @@ class FALCONEvaluator(Evaluator):
                 batch,
                 rgb_frames,
             )
+
+            # Pause wm_frames in sync with rgb_frames
+            if wm_frames is not None and len(envs_to_pause) > 0:
+                state_index = list(range(envs.num_envs + len(envs_to_pause)))
+                for idx in reversed(envs_to_pause):
+                    state_index.pop(idx)
+                wm_frames = [wm_frames[i] for i in state_index]
 
             # We pause the statefull parameters in the policy.
             # We only do this if there are envs to pause to reduce the overhead.

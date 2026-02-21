@@ -488,9 +488,10 @@ class WorldModelConfig(HabitatBaselinesBaseConfig):
     fuse_keys_1d: Optional[List[str]] = None
     human_state_goal_keys: Optional[List[str]] = None
     num_humans: int = 6
-    pred_horizon: int = 5
+    pred_horizon: int = 4
     use_goal_conditioning: bool = True
     state_goal_dim: int = 8
+    residual: bool = True
 
     pretrained_wm_checkpoint: Optional[str] = None
 
@@ -517,6 +518,8 @@ class WorldModelConfig(HabitatBaselinesBaseConfig):
     reward_loss_scale: float = 1.0
     kl_loss_scale: float = 0.1
     kl_free_bits: float = 1.0
+    kl_dyn_scale: float = 0.5
+    kl_rep_scale: float = 0.1
 
     # 分布式
     ddp: bool = True

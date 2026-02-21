@@ -462,8 +462,13 @@ class SocialNavEncoder(nn.Module):
 
 class DepthDecoder(nn.Module):
     """
-    Depth Reconstruction Decoder
-    根据latent feature重建depth observation
+    Depth Reconstruction Decoder with U-Net style multi-scale skip connections.
+
+    The encoder caches multi-scale feature maps from ResNet layers:
+      [feat_2d (128, 4, 4), f3 (512, 8, 8), f2 (256, 16, 16), f1 (128, 32, 32)]
+
+    These are fused into the ConvDecoder's upsampling path at matching spatial
+    resolutions via channel concatenation + 1×1 conv adapters.
     """
     def __init__(
         self,
@@ -475,8 +480,10 @@ class DepthDecoder(nn.Module):
         kernel_size=4,
         minres=4,
         outscale=1.0,
+        skip_channels=None,
     ):
         super(DepthDecoder, self).__init__()
+
         self._depth_decoder = ConvDecoder(
             feat_size,
             shape=(depth_shape[2], depth_shape[0], depth_shape[1]),
@@ -489,20 +496,143 @@ class DepthDecoder(nn.Module):
             cnn_sigmoid=True,
         )
 
-    def forward(self, features):
+        # Build per-resolution skip fusion adapters
+        # skip_channels: list of (encoder_ch, spatial_h, spatial_w) for each skip
+        self._skip_adapters = nn.ModuleList()
+        self._skip_spatial = []
+        if skip_channels:
+            act_fn = getattr(torch.nn, act)
+            dec = self._depth_decoder
+            # Compute decoder channel sizes at each stage
+            # After linear+reshape: bottleneck_ch at h_list[0] x w_list[0]
+            # After deconv i: output at h_list[i+1] x w_list[i+1]
+            bottleneck_ch = dec._embed_size // (dec.h_list[0] * dec.w_list[0])
+            # decoder channels before each deconv layer
+            layer_num = len(dec.h_list) - 1
+            dec_channels = [bottleneck_ch]
+            ch = bottleneck_ch
+            for i in range(layer_num):
+                if i == layer_num - 1:
+                    ch = dec._shape[0]
+                elif i == 0:
+                    ch = bottleneck_ch // 2
+                else:
+                    ch = 2 ** (layer_num - i - 2) * depth
+                dec_channels.append(ch)
+
+            for enc_ch, sp_h, sp_w in skip_channels:
+                matched = False
+                # Match against bottleneck (before deconv 0)
+                if sp_h == dec.h_list[0] and sp_w == dec.w_list[0]:
+                    dec_ch = dec_channels[0]
+                    self._skip_spatial.append(('pre', 0, sp_h, sp_w))
+                    matched = True
+                else:
+                    # Match against post-deconv outputs
+                    for i in range(layer_num):
+                        if sp_h == dec.h_list[i + 1] and sp_w == dec.w_list[i + 1]:
+                            dec_ch = dec_channels[i + 1]
+                            self._skip_spatial.append(('post', i, sp_h, sp_w))
+                            matched = True
+                            break
+                if not matched:
+                    continue
+                adapter = nn.Sequential(
+                    nn.Conv2d(dec_ch + enc_ch, dec_ch, kernel_size=1, bias=False),
+                    ImgChLayerNorm(dec_ch) if norm else nn.Identity(),
+                    act_fn(),
+                )
+                adapter.apply(tools.weight_init)
+                self._skip_adapters.append(adapter)
+
+    def _expand_skip(self, sf, target_batch):
+        """Expand skip feature from (B, C, H, W) to (B*T, C, H, W) if needed."""
+        if sf.shape[0] == target_batch:
+            return sf
+        T = target_batch // sf.shape[0]
+        return sf.unsqueeze(1).expand(-1, T, -1, -1, -1).reshape(-1, *sf.shape[1:])
+
+    def forward(self, features, skip_feats=None):
         """
-        Decode depth from features
-        Returns distribution over depth values
+        Args:
+            features: RSSM features (batch, [time,] feat_dim)
+            skip_feats: Optional list of encoder feature maps, ordered
+                        coarse-to-fine: [(128,4,4), (512,8,8), (256,16,16), (128,32,32)]
         """
-        depth_mean = self._depth_decoder(features)
-        return tools.MSEDist(depth_mean, agg="sum")
+        dec = self._depth_decoder
+
+        x = dec._linear_layer(features)
+        x = x.reshape(
+            [-1, dec.h_list[0], dec.w_list[0],
+             dec._embed_size // (dec.h_list[0] * dec.w_list[0])]
+        )
+        x = x.permute(0, 3, 1, 2)  # (B*T, ch, 4, 4)
+
+        # Build lookup: (position_type, layer_idx) → (adapter, skip_feat)
+        skip_lookup = {}
+        if skip_feats is not None and len(self._skip_adapters) > 0:
+            for idx, (adapter, (pos_type, layer_i, _, _)) in enumerate(
+                zip(self._skip_adapters, self._skip_spatial)
+            ):
+                sf = self._expand_skip(skip_feats[idx], x.shape[0])
+                skip_lookup[(pos_type, layer_i)] = (adapter, sf)
+
+        # Apply pre-deconv skip at bottleneck
+        if ('pre', 0) in skip_lookup:
+            adapter, sf = skip_lookup[('pre', 0)]
+            x = adapter(torch.cat([x, sf], dim=1))
+
+        # Run deconv layers one by one, injecting skips after matching layers
+        # ConvDecoder.layers is a Sequential of [ConvTranspose2d, (Norm), (Act), ...]
+        # We need to group them into per-stage blocks
+        stage_blocks = self._split_decoder_stages(dec)
+        for i, block in enumerate(stage_blocks):
+            for layer in block:
+                x = layer(x)
+            if ('post', i) in skip_lookup:
+                adapter, sf = skip_lookup[('post', i)]
+                x = adapter(torch.cat([x, sf], dim=1))
+
+        mean = x.permute(0, 2, 3, 1)
+        mean = mean.reshape(features.shape[:-1] + dec._shape[1:] + (dec._shape[0],))
+
+        if dec._cnn_sigmoid:
+            mean = F.sigmoid(mean)
+
+        return tools.MSEDist(mean, agg="mean")
+
+    @staticmethod
+    def _split_decoder_stages(dec):
+        """Split ConvDecoder.layers into per-stage blocks.
+
+        Each stage starts with a ConvTranspose2d and includes the following
+        normalization and activation layers (if any) until the next
+        ConvTranspose2d.
+        """
+        stages = []
+        current = []
+        for m in dec.layers:
+            if isinstance(m, nn.ConvTranspose2d) and current:
+                stages.append(current)
+                current = []
+            current.append(m)
+        if current:
+            stages.append(current)
+        return stages
 
 
 class HumanTrajectoryDecoder(nn.Module):
     """
-    Human Future Trajectory Prediction Decoder
-    预测 N 个行人的 future trajectories。
-    Goal conditioning 使用 human_state_goal (N, 8)：pos, vel, goal, rotation, dist_to_goal。
+    Per-human trajectory prediction decoder with residual output.
+
+    Architecture:
+      1. Per-human goal encoder: (N, 8) → (N, H)  — two-layer MLP, shared weights
+      2. Per-human MLP: concat(feat_broadcast, goal_h) → (N, H) → (N, T*2)
+      3. Residual: output = delta + anchor_pos
+
+    Each human's trajectory is decoded independently conditioned on the shared
+    world-model feature and its own goal/state vector. This preserves the
+    identity mapping between goal info and trajectory output.
     """
     def __init__(
         self,
@@ -516,34 +646,38 @@ class HumanTrajectoryDecoder(nn.Module):
         norm=True,
         outscale=1.0,
         use_goal_conditioning=True,
-        state_goal_dim=8,  # human_state_goal 每行人维度 (pos, vel, goal, rotation, dist_to_goal)
+        state_goal_dim=8,
+        residual=True,
     ):
         super(HumanTrajectoryDecoder, self).__init__()
         self.num_humans = num_humans
         self.pred_horizon = pred_horizon
         self.traj_dim = traj_dim
         self.state_goal_dim = state_goal_dim
-        self.output_dim = num_humans * pred_horizon * traj_dim
         self.use_goal_conditioning = use_goal_conditioning
+        self.residual = residual
 
         act_fn = getattr(torch.nn, act)
 
-        # Goal conditioning: 使用 human_state_goal (num_humans, 8)
+        # Per-human goal encoder (shared across all humans)
         if use_goal_conditioning:
-            goal_input_dim = num_humans * state_goal_dim
-            self.goal_encoder = nn.Sequential(
-                nn.Linear(goal_input_dim, hidden_units, bias=False),
+            self.goal_per_human = nn.Sequential(
+                nn.Linear(state_goal_dim, hidden_units, bias=False),
+                nn.LayerNorm(hidden_units, eps=1e-03) if norm else nn.Identity(),
+                act_fn(),
+                nn.Linear(hidden_units, hidden_units, bias=False),
                 nn.LayerNorm(hidden_units, eps=1e-03) if norm else nn.Identity(),
                 act_fn(),
             )
-            self.goal_encoder.apply(tools.weight_init)
-            inp_dim = feat_size + hidden_units
+            self.goal_per_human.apply(tools.weight_init)
+            mlp_inp_dim = feat_size + hidden_units
         else:
-            self.goal_encoder = None
-            inp_dim = feat_size
+            self.goal_per_human = None
+            mlp_inp_dim = feat_size
 
-        # Main MLP
+        # Per-human trajectory MLP (shared across all humans)
         layers = []
+        inp_dim = mlp_inp_dim
         for i in range(hidden_layers):
             layers.append(nn.Linear(inp_dim, hidden_units, bias=False))
             if norm:
@@ -554,33 +688,42 @@ class HumanTrajectoryDecoder(nn.Module):
         self._mlp = nn.Sequential(*layers)
         self._mlp.apply(tools.weight_init)
 
-        self._out_layer = nn.Linear(hidden_units, self.output_dim)
+        self._out_layer = nn.Linear(hidden_units, pred_horizon * traj_dim)
         self._out_layer.apply(tools.uniform_weight_init(outscale))
 
     def forward(self, features, human_state_goal=None):
         """
         Args:
-            features: World model features (batch, [time,] feat_dim)
-            human_state_goal: Optional (batch, [time,] num_humans, state_goal_dim)
-                             state_goal_dim=8: pos(2), vel(2), goal(2), rotation, dist_to_goal
+            features: (batch, [time,] feat_dim)
+            human_state_goal: (batch, [time,] num_humans, state_goal_dim)
 
         Returns:
-            Distribution over trajectories
+            MSEDist over trajectory positions (batch, [time,] N, T, 2).
         """
-        if self.use_goal_conditioning and human_state_goal is not None:
-            goal_flat = human_state_goal.reshape(*human_state_goal.shape[:-2], -1)
-            goal_feat = self.goal_encoder(goal_flat)
-            x = torch.cat([features, goal_feat], dim=-1)
-        else:
-            x = features
-
-        x = self._mlp(x)
-        traj_mean = self._out_layer(x)
-        orig_shape = list(traj_mean.shape[:-1])
-        traj_mean = traj_mean.reshape(
-            orig_shape + [self.num_humans, self.pred_horizon, self.traj_dim]
+        # Broadcast feat to per-human: (..., feat_dim) → (..., N, feat_dim)
+        feat_expanded = features.unsqueeze(-2).expand(
+            *features.shape[:-1], self.num_humans, features.shape[-1]
         )
-        return tools.MSEDist(traj_mean, agg="sum")
+
+        if self.use_goal_conditioning and human_state_goal is not None:
+            goal_h = self.goal_per_human(human_state_goal)   # (..., N, H)
+            x = torch.cat([feat_expanded, goal_h], dim=-1)   # (..., N, feat+H)
+        else:
+            x = feat_expanded
+
+        x = self._mlp(x)                                     # (..., N, H)
+        traj_delta = self._out_layer(x)                       # (..., N, T*2)
+        traj_delta = traj_delta.reshape(
+            *traj_delta.shape[:-1], self.pred_horizon, self.traj_dim
+        )                                                     # (..., N, T, 2)
+
+        if self.residual and human_state_goal is not None:
+            anchor = human_state_goal[..., :self.traj_dim]    # (..., N, 2)
+            traj_mean = traj_delta + anchor.unsqueeze(-2)     # (..., N, T, 2)
+        else:
+            traj_mean = traj_delta
+
+        return tools.MSEDist(traj_mean, agg="mean")
 
 
 class RewardDecoder(nn.Module):

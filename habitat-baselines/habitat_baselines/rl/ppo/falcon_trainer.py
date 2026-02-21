@@ -67,6 +67,11 @@ from habitat_baselines.utils.info_dict import (
     extract_scalars_from_infos,
 )
 from habitat_baselines.utils.timing import g_timer
+from habitat_baselines.utils.wm_visualizer import (
+    render_depth_comparison,
+    render_trajectory_comparison,
+    compose_wm_frame,
+)
 
 def contains_inf_or_nan(observations):
     for key, value in observations.items():
@@ -99,7 +104,13 @@ class _WorldModelTrainModule(torch.nn.Module):
         super().__init__()
         self.world_model = world_model
 
-    def forward(self, batch: Dict[str, torch.Tensor], kl_free_bits: float):
+    def forward(
+        self,
+        batch: Dict[str, torch.Tensor],
+        kl_free_bits: float,
+        kl_dyn_scale: float = 0.5,
+        kl_rep_scale: float = 0.1,
+    ):
         # Encode observations: (B, T, ...) -> (B*T, ...)
         batch_size, seq_len = batch["actions"].shape[:2]
         flat_obs = {}
@@ -128,7 +139,8 @@ class _WorldModelTrainModule(torch.nn.Module):
             (k for k in batch["observations"] if "depth" in k.lower()),
             None,
         )
-        depth_dist = self.world_model.heads["depth"](feat)
+        skip_feats = getattr(self.world_model.encoder, '_cached_visual_feats_ms', None)
+        depth_dist = self.world_model.heads["depth"](feat, skip_feats=skip_feats)
         if depth_key is not None:
             depth_target = batch["observations"][depth_key]
             depth_loss = -depth_dist.log_prob(depth_target).mean()
@@ -181,7 +193,8 @@ class _WorldModelTrainModule(torch.nn.Module):
                     torch.arange(num_humans, device=traj_target.device)
                     < human_num.unsqueeze(-1)
                 ).float()
-                sq = (traj_mean - traj_target).pow(2).sum(dim=(-2, -1))
+                # Per-human mean-squared error, masked by valid humans
+                sq = (traj_mean - traj_target).pow(2).mean(dim=(-2, -1))
                 traj_loss = (sq * mask).sum() / mask.sum().clamp(min=1e-8)
             else:
                 traj_loss = -traj_dist.log_prob(traj_target).mean()
@@ -195,12 +208,14 @@ class _WorldModelTrainModule(torch.nn.Module):
             reward_target = reward_target.unsqueeze(-1)
         reward_loss = -reward_dist.log_prob(reward_target).mean()
 
-        # KL with free bits.
-        kl_loss = torch.distributions.kl.kl_divergence(
-            self.world_model.dynamics.get_dist(post),
-            self.world_model.dynamics.get_dist(prior),
+        # KL with DreamerV3-style balancing.
+        kl_loss, kl_value, dyn_loss, rep_loss = self.world_model.dynamics.kl_loss(
+            post, prior,
+            free=kl_free_bits,
+            dyn_scale=kl_dyn_scale,
+            rep_scale=kl_rep_scale,
         )
-        kl_loss = torch.clamp(kl_loss - kl_free_bits, min=0.0).mean()
+        kl_loss = kl_loss.mean()
 
         return {
             "depth_loss": depth_loss,
@@ -515,6 +530,8 @@ class FalconTrainer(BaseRLTrainer):
         self.reward_loss_scale = getattr(wm_config, "reward_loss_scale", 1.0)
         self.kl_loss_scale = getattr(wm_config, "kl_loss_scale", 0.1)
         self.kl_free_bits = getattr(wm_config, "kl_free_bits", 1.0)
+        self.kl_dyn_scale = getattr(wm_config, "kl_dyn_scale", 0.5)
+        self.kl_rep_scale = getattr(wm_config, "kl_rep_scale", 0.1)
 
         # Create WM optimizer (only include trainable params, excludes frozen encoder)
         self.wm_optimizer = torch.optim.Adam(
@@ -729,6 +746,7 @@ class FalconTrainer(BaseRLTrainer):
         Returns:
             dict containing checkpoint info
         """
+        kwargs.setdefault("weights_only", False)
         return torch.load(checkpoint_path, *args, **kwargs)
 
     def _should_update_world_model(self, update):
@@ -914,6 +932,7 @@ class FalconTrainer(BaseRLTrainer):
         }
 
         num_batches_trained = 0
+        last_batch = None
 
         # 训练多个 epochs
         for epoch in range(self.wm_epochs_per_update):
@@ -949,7 +968,11 @@ class FalconTrainer(BaseRLTrainer):
             batch['is_first'][:, 0] = 1.0
 
             # 2. WM forward pass (through DDP wrapper if enabled)
-            wm_losses = self.wm_train_model(batch, self.kl_free_bits)
+            wm_losses = self.wm_train_model(
+                batch, self.kl_free_bits,
+                kl_dyn_scale=self.kl_dyn_scale,
+                kl_rep_scale=self.kl_rep_scale,
+            )
             depth_loss = wm_losses["depth_loss"]
             traj_loss = wm_losses["traj_loss"]
             reward_loss = wm_losses["reward_loss"]
@@ -982,6 +1005,7 @@ class FalconTrainer(BaseRLTrainer):
             wm_losses_sum['kl_loss'] += kl_loss.item()
             wm_losses_sum['total_loss'] += wm_loss.item()
             num_batches_trained += 1
+            last_batch = batch
 
         # Keep WM optimizer path isolated from PPO path.
         self._clear_world_model_grads()
@@ -1002,7 +1026,105 @@ class FalconTrainer(BaseRLTrainer):
                 f"total={wm_losses_sum['total_loss']:.3f}"
             )
 
+        # Visualize a few samples from the last batch
+        if rank0_only() and last_batch is not None:
+            self._last_wm_vis_batch = last_batch
+
         return wm_losses_sum
+
+    @torch.no_grad()
+    def _visualize_wm_predictions(self, writer, step, num_samples=3):
+        """Generate WM prediction visualizations, save to disk and optionally to tensorboard."""
+        import cv2
+
+        batch = getattr(self, '_last_wm_vis_batch', None)
+        if batch is None:
+            return
+
+        wm = self.world_model
+        wm.eval()
+
+        B, T = batch["actions"].shape[:2]
+        num_samples = min(num_samples, B)
+
+        flat_obs = {}
+        for key, val in batch["observations"].items():
+            flat_obs[key] = val.reshape(B * T, *val.shape[2:])
+
+        flat_embed = wm.encoder(flat_obs)
+        embed = flat_embed.reshape(B, T, -1)
+
+        actions_oh = F.one_hot(
+            batch["actions"].long().squeeze(-1),
+            num_classes=wm.dynamics._num_actions,
+        ).float()
+
+        post, _ = wm.dynamics.observe(embed, actions_oh, batch["is_first"])
+        feat = wm.dynamics.get_feat(post)
+
+        skip_feats = getattr(wm.encoder, '_cached_visual_feats_ms', None)
+        depth_dist = wm.heads["depth"](feat, skip_feats=skip_feats)
+        pred_depth = depth_dist.mean()
+
+        human_state_goal = next(
+            (batch["observations"][k] for k in batch["observations"] if "human_state_goal" in k),
+            None,
+        )
+
+        traj_dist = wm.heads["human_traj"](feat, human_state_goal=human_state_goal)
+        pred_traj = traj_dist.mean()
+
+        depth_key = next((k for k in batch["observations"] if "depth" in k.lower()), None)
+        traj_key = next((k for k in batch["observations"] if "future_trajectory" in k.lower()), None)
+        human_num_key = next((k for k in batch["observations"] if "human_num" in k.lower()), None)
+
+        vis_dir = os.path.join(
+            self.config.habitat_baselines.checkpoint_folder, "wm_vis"
+        )
+        os.makedirs(vis_dir, exist_ok=True)
+
+        mid_t = T // 2
+        for i in range(num_samples):
+            depth_frame = None
+            if depth_key is not None:
+                gt_d = batch["observations"][depth_key][i, mid_t].cpu().numpy()
+                pd_d = pred_depth[i, mid_t].cpu().numpy()
+                if gt_d.max() > 1.0:
+                    gt_d = gt_d / 255.0
+                if gt_d.ndim == 3:
+                    gt_d = gt_d[..., 0]
+                if pd_d.ndim == 3:
+                    pd_d = pd_d[..., 0]
+                if gt_d.shape != pd_d.shape:
+                    pd_d = cv2.resize(pd_d, (gt_d.shape[1], gt_d.shape[0]))
+                depth_frame = render_depth_comparison(gt_d, pd_d)
+
+            traj_frame = None
+            if traj_key is not None:
+                gt_tr = batch["observations"][traj_key][i, mid_t].cpu().numpy()
+                pd_tr = pred_traj[i, mid_t].cpu().numpy()
+                if human_num_key is not None:
+                    nh = int(batch["observations"][human_num_key][i, mid_t].item())
+                else:
+                    nh = gt_tr.shape[0]
+                hp = None
+                if human_state_goal is not None:
+                    hp = human_state_goal[i, mid_t].cpu().numpy()[:, :2]
+
+                traj_frame = render_trajectory_comparison(gt_tr, pd_tr, nh, human_positions=hp)
+
+            frame = compose_wm_frame(depth_frame, traj_frame)
+            if frame is not None:
+                save_path = os.path.join(vis_dir, f"step{step:08d}_sample{i}.png")
+                cv2.imwrite(save_path, frame)
+
+                if writer is not None:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_tensor = torch.from_numpy(frame_rgb).permute(2, 0, 1).float() / 255.0
+                    writer.add_image(f"wm_vis/sample_{i}", frame_tensor, step)
+
+        logger.info(f"[WM Vis] Saved {num_samples} visualization(s) to {vis_dir}")
+        self._last_wm_vis_batch = None
 
     def _compute_actions_and_step_envs(self, buffer_index: int = 0):
         num_envs = self.envs.num_envs
@@ -1756,6 +1878,11 @@ class FalconTrainer(BaseRLTrainer):
                     # 添加 WM losses 到总 losses
                     for key, value in wm_losses.items():
                         losses[f'wm_{key}'] = value
+                    # 每 10000 次 update 才存储 WM 可视化到磁盘并写 TensorBoard
+                    if rank0_only() and (self.num_updates_done % 10000 == 0):
+                        self._visualize_wm_predictions(
+                            writer, self.num_steps_done, num_samples=3
+                        )
 
                 self._training_log(
                     writer, losses, prev_time,

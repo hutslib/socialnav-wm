@@ -33,15 +33,25 @@ export HYDRA_FULL_ERROR=1
 if [[ "$EXP_INPUT" == *.yaml ]]; then
     CONFIG_NAME="$(basename "$EXP_INPUT")"
     EXP_NAME="${CONFIG_NAME%.yaml}"
+    # Strip _eval suffix for checkpoint dir lookup
+    EXP_NAME_BASE="${EXP_NAME%_eval}"
 else
     EXP_NAME="$EXP_INPUT"
     if [[ "$EXP_NAME" != exp_* ]]; then
         EXP_NAME="exp_${EXP_NAME}"
     fi
-    CONFIG_NAME="${EXP_NAME}.yaml"
+    EXP_NAME_BASE="$EXP_NAME"
+    # Prefer _eval config if it exists
+    EVAL_CONFIG="00_iros_exp_config/${EXP_NAME}_eval.yaml"
+    if [ -f "$EVAL_CONFIG" ]; then
+        CONFIG_NAME="${EXP_NAME}_eval.yaml"
+        echo "使用 eval 专用配置: ${CONFIG_NAME}"
+    else
+        CONFIG_NAME="${EXP_NAME}.yaml"
+    fi
 fi
 
-CKPT_DIR="experiments/${EXP_NAME}/checkpoints"
+CKPT_DIR="experiments/${EXP_NAME_BASE}/checkpoints"
 
 if [ ! -d "$CKPT_DIR" ]; then
     echo "错误: 找不到checkpoint目录: $CKPT_DIR"
@@ -66,8 +76,11 @@ echo "使用checkpoint: ${CKPT_PATH}"
 python -u -m habitat_baselines.run \
     --config-name="${CONFIG_NAME}" \
     habitat_baselines.evaluate=True \
-    habitat_baselines.load_checkpoint=${CKPT_PATH} \
+    habitat_baselines.eval_ckpt_path_dir=${CKPT_PATH} \
+    habitat_baselines.eval.should_load_ckpt=True \
+    "habitat_baselines.eval.video_option=[disk]" \
+    habitat_baselines.video_dir="eval_experiments/${EXP_NAME_BASE}/video" \
     habitat_baselines.num_environments=1 \
-    habitat_baselines.test_episode_count=100
+    habitat_baselines.test_episode_count=50
 
 echo "评估完成: ${EXP_NAME}"

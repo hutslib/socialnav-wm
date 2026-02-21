@@ -1,0 +1,32 @@
+defaults:
+  - exp_01_baseline
+  - _self_
+
+no_aux_loss: false
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_01_baseline_finetune/tb"
+  video_dir: "experiments/exp_01_baseline_finetune/video"
+  checkpoint_folder: "experiments/exp_01_baseline_finetune/checkpoints"
+  load_resume_state_config: False
+
+  rl:
+    ppo:
+      lr: 1.0e-4
+
+    ddppo:
+      pretrained: True
+      pretrained_weights: experiments/exp_09_baseline_no_aux/checkpoints/latest.pth
+      pretrained_encoder: False
+      reset_critic: False
+
+    auxiliary_losses:
+      people_counting:
+        max_human_num: 6
+        position_dim: 2
+        loss_scale: 0.1
+        future_step: 4
+      guess_human_position:
+        max_human_num: 6
+        position_dim: 2
+        loss_scale: 0.1

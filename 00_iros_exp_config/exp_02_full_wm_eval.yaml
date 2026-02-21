@@ -1,6 +1,12 @@
 # @package _global_
-# 实验 2: full wm (完整 World Model V2)
-# 目的: 展示完整 WM 的性能提升
+# 实验 2 评估配置: full wm (完整 World Model V2)
+# 用法:
+#   python -u -m habitat_baselines.run \
+#       --config-name=exp_02_full_wm_eval.yaml \
+#       habitat_baselines.eval_ckpt_path_dir=experiments/exp_02_full_wm/checkpoints/ckpt.XXX.pth
+#
+# 或通过 eval_experiment.sh:
+#   ./01_iros_exp_scripts/eval_experiment.sh exp_02_full_wm
 
 defaults:
   - /benchmark/nav/socialnav_v2: falcon_hm3d_task_for_train
@@ -28,14 +34,17 @@ defaults:
 
 habitat:
   dataset:
-    split: train
+    split: val
+  environment:
+    iterator_options:
+      shuffle: False
   gym:
     obs_keys:
       - agent_0_articulated_agent_jaw_depth
       - agent_0_pointgoal_with_gps_compass
       - agent_0_localization_sensor
       - agent_0_human_num_sensor
-      - agent_0_human_state_goal  # 融合传感器
+      - agent_0_human_state_goal
       - agent_0_oracle_humanoid_future_trajectory
   task:
     actions:
@@ -92,22 +101,23 @@ habitat:
         allow_dyn_slide: True
 
 habitat_baselines:
-  evaluate: False
+  evaluate: True
   verbose: True
   trainer_name: "falcon_trainer"
   torch_gpu_id: 0
-  tensorboard_dir: "experiments/exp_02_full_wm/tb"
-  video_dir: "experiments/exp_02_full_wm/video"
+  tensorboard_dir: "eval_experiments/exp_02_full_wm/tb"
+  video_dir: "eval_experiments/exp_02_full_wm/video"
+  video_fps: 10
   checkpoint_folder: "experiments/exp_02_full_wm/checkpoints"
-  test_episode_count: -1
-  num_environments: 28
+  eval_ckpt_path_dir: "experiments/exp_02_full_wm/checkpoints"
+  test_episode_count: 50
+  num_environments: 1
   num_updates: -1
   total_num_steps: 15000000
   log_interval: 1
-  num_checkpoints: -1 # use checkpoint_interval instead of percent-based saving
-  checkpoint_interval: 20 # save ckpt every 20 updates
+  num_checkpoints: 1
   force_torch_single_threaded: True
-  load_resume_state_config: True
+  load_resume_state_config: False
 
   evaluator:
     _target_: habitat_baselines.rl.ppo.falcon_evaluator.FALCONEvaluator
@@ -115,10 +125,9 @@ habitat_baselines:
   eval:
     use_ckpt_config: False
     should_load_ckpt: True
+    video_option: ["disk"]
 
   rl:
-    preemption:
-      save_resume_state_interval: 20
     agent:
       type: "MultiAgentAccessMgr"
       num_agent_types: 7
@@ -128,7 +137,7 @@ habitat_baselines:
       force_partner_sample_idx: -1
     policy:
       agent_0:
-        name: "SocialNavWMPolicyV2"  # 使用World Model Policy
+        name: "SocialNavWMPolicyV2"
     ppo:
       clip_param: 0.2
       ppo_epoch: 2
@@ -160,9 +169,6 @@ habitat_baselines:
       backbone: resnet50
       rnn_type: LSTM
       num_recurrent_layers: 2
-      # Exclude WM from DDP allreduce (WM trained by separate optimizer, PPO uses detached WM features)
-      ddp_ignore_param_patterns:
-        - ".net.world_model."
 
     auxiliary_losses:
       people_counting:
@@ -177,60 +183,50 @@ habitat_baselines:
         future_step: 4
         loss_scale: 0.1
 
-  # ==================== World Model (WorldModelConfig) ====================
+  # ==================== World Model (与训练配置一致) ====================
   world_model:
     enabled: True
-    train_world_model: True
+    train_world_model: False
     fusion_mode: late
 
-    # Encoder / 视觉 (使用 Falcon ResNet encoder，与 policy 共享相同架构)
     encoder_type: falcon
     falcon_backbone: resnet50
     falcon_baseplanes: 32
     falcon_ngroups: 16
-    falcon_pretrained_path: "pretrained_model/pretrained_habitat3.pth"
-    freeze_wm_encoder: True  # 冻结预训练 encoder，仅训练 RSSM + decoders
+    falcon_pretrained_path: null  # eval 时由 checkpoint 加载全部权重，无需预训练路径
+    freeze_wm_encoder: True
     mlp_units: 256
 
-    # RSSM
     dyn_stoch: 30
     dyn_deter: 200
     dyn_hidden: 200
     dyn_discrete: 32
 
-    # 通用
     act: SiLU
     norm: True
     num_humans: 6
-    pred_horizon: 5
+    pred_horizon: 4
     use_goal_conditioning: True
     state_goal_dim: 8
 
-    # 训练策略
-    wm_train_ratio: 1.0
-    wm_warmup_updates: 2
+    wm_train_ratio: 0.0
+    wm_warmup_updates: 0
     wm_grad_clip: 100.0
 
-    # WM 优化器与 batch
     wm_lr: 3e-4
     opt_eps: 1e-5
     weight_decay: 0.0
     wm_batch_size: 16
     wm_sequence_length: 50
-    wm_epochs_per_update: 15  # 每次 WM 更新训 10 个 batch
+    wm_epochs_per_update: 0
 
-    # Replay buffer
     replay_buffer_size: 20000
-    replay_buffer_warmup: 5000
+    replay_buffer_warmup: 0
 
-    # Loss 权重
     depth_loss_scale: 0.05
     traj_loss_scale: 1.0
     reward_loss_scale: 1.0
     kl_loss_scale: 0.1
     kl_free_bits: 1.0
-    kl_dyn_scale: 0.5
-    kl_rep_scale: 0.1
 
-    # 分布式
-    ddp: True
+    ddp: False

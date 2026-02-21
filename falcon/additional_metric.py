@@ -458,17 +458,15 @@ class HumanFutureTrajectory(UsesArticulatedAgentInterface, Measure):
         found_path = self._sim.pathfinder.find_path(path)
         return path.points if found_path else [point_a, point_b]
 
-    def _process_path(self, path):
-        """Process the path by merging and padding/truncating to the desired length."""
+    def _get_next_waypoint(self, path):
+        """Extract the next waypoint from the merged path (first point after current pos)."""
         temp_merged_path = merge_paths(path)
-        
-        if len(temp_merged_path) < self.output_length:
-            padding = np.full((self.output_length - len(temp_merged_path), 3), temp_merged_path[-1], dtype=np.float32)
-            temp_merged_path = np.concatenate([temp_merged_path, padding], axis=0)
+        if len(temp_merged_path) >= 2:
+            return np.array(temp_merged_path[1], dtype=np.float32).tolist()
+        elif len(temp_merged_path) == 1:
+            return np.array(temp_merged_path[0], dtype=np.float32).tolist()
         else:
-            temp_merged_path = np.array(temp_merged_path[:self.output_length], dtype=np.float32)
-        
-        return temp_merged_path.tolist()
+            return None
 
     def update_metric(self, *args, episode, task, observations, **kwargs):
         for agent_idx, target in enumerate(self.target_dict):
@@ -482,8 +480,12 @@ class HumanFutureTrajectory(UsesArticulatedAgentInterface, Measure):
                 path.append(temp_path)
                 prev_point = path_point
 
-            self.path_dict[agent_idx + 1] = self._process_path(path)
-            
+            next_wp = self._get_next_waypoint(path)
+            if next_wp is not None:
+                self.path_dict[agent_idx + 1] = [next_wp]
+            else:
+                self.path_dict[agent_idx + 1] = [agent_pos.tolist()]
+
         self._metric = self.path_dict
 
 @dataclass

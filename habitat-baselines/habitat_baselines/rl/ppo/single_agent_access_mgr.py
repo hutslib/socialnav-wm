@@ -209,90 +209,71 @@ class SingleAgentAccessMgr(AgentAccessMgr):
             orig_action_space=self._env_spec.orig_action_space,
             agent_name=self.agent_name,
         )
-        pretrained_model_state = None
-        if (
-            self.agent_name in ("agent_0", "main_agent")
-            and (
-                self._config.habitat_baselines.rl.ddppo.pretrained_encoder
-                or self._config.habitat_baselines.rl.ddppo.pretrained
-            )
+        is_main = self.agent_name in ("agent_0", "main_agent")
+        if is_main and (
+            self._config.habitat_baselines.rl.ddppo.pretrained
+            or self._config.habitat_baselines.rl.ddppo.pretrained_encoder
         ):
-            pretrained_state = torch.load(
+            ckpt = torch.load(
                 self._config.habitat_baselines.rl.ddppo.pretrained_weights,
                 map_location="cpu",
                 weights_only=False,
             )
-            if isinstance(pretrained_state, dict) and "state_dict" in pretrained_state:
-                # Single-agent ckpt format: {"state_dict": ...}
-                pretrained_model_state = pretrained_state["state_dict"]
-            elif (
-                isinstance(pretrained_state, dict)
-                and 0 in pretrained_state
-                and isinstance(pretrained_state[0], dict)
-                and "state_dict" in pretrained_state[0]
-            ):
-                # Multi-agent ckpt format: {0: {"state_dict": ...}, 1: ...}
-                pretrained_model_state = pretrained_state[0]["state_dict"]
-            elif (
-                isinstance(pretrained_state, dict)
-                and "0" in pretrained_state
-                and isinstance(pretrained_state["0"], dict)
-                and "state_dict" in pretrained_state["0"]
-            ):
-                pretrained_model_state = pretrained_state["0"]["state_dict"]
 
-            if pretrained_model_state is None:
-                raise KeyError(
-                    "Cannot find pretrained state_dict in checkpoint. "
-                    "Expected either top-level 'state_dict' or per-agent "
-                    "entry like ckpt[0]['state_dict'] for multi-agent checkpoints."
-                )
-            # Support both key styles:
-            # 1) actor_critic.xxx  2) xxx
-            pretrained_model_state = {
-                (
-                    k[len("actor_critic.") :]
-                    if isinstance(k, str) and k.startswith("actor_critic.")
-                    else k
-                ): v
-                for k, v in pretrained_model_state.items()
-            }
+            pretrained_model_state = ckpt[0]["state_dict"]
 
-        # adapt to multi-agent setup
-        if (
-            self.agent_name in ("agent_0", "main_agent")
-            and self._config.habitat_baselines.rl.ddppo.pretrained
-        ):
-            needs_shape_filtered_load = (
-                "oracle_humanoid_future_trajectory"
-                in self._env_spec.observation_space.spaces
-                or bool(self._config.habitat_baselines.rl.auxiliary_losses)
-            )
-            if needs_shape_filtered_load:
-                model_state_dict = actor_critic.state_dict()
-                filtered_pretrained_state_dict = {
+            if self._config.habitat_baselines.rl.ddppo.pretrained:
+                model_sd = actor_critic.state_dict()
+                matched = {
                     k: v
                     for k, v in pretrained_model_state.items()
-                    if k in model_state_dict and v.shape == model_state_dict[k].shape
+                    if k in model_sd and v.shape == model_sd[k].shape
                 }
-                model_state_dict.update(filtered_pretrained_state_dict)
-                actor_critic.load_state_dict(model_state_dict, strict=False)
-            else:
-                actor_critic.load_state_dict(
-                        pretrained_model_state
+                ckpt_not_matched = len(pretrained_model_state) - len(matched)
+                model_random_init = len(model_sd) - len(matched)
+                matched_params = sum(v.numel() for v in matched.values())
+                ckpt_total_params = sum(v.numel() for v in pretrained_model_state.values())
+                model_sd.update(matched)
+                actor_critic.load_state_dict(model_sd, strict=False)
+                # Verify: after load, model params equal ckpt for matched keys
+                verify_keys = list(matched.keys())[:5]
+                ok = all(
+                    torch.allclose(
+                        actor_critic.state_dict()[k].cpu().float(),
+                        matched[k].cpu().float(),
+                        atol=1e-6,
+                        rtol=1e-5,
                     )
-        elif (
-            self.agent_name in ("agent_0", "main_agent")
-            and self._config.habitat_baselines.rl.ddppo.pretrained_encoder
-        ):
-            prefix = "actor_critic.net.visual_encoder."
-            actor_critic.net.visual_encoder.load_state_dict(
-                {
-                    k[len(prefix) :]: v
+                    for k in verify_keys
+                )
+                logger.info(
+                    f"Loaded pretrained policy from {self._config.habitat_baselines.rl.ddppo.pretrained_weights}: "
+                    f"matched {len(matched)} keys ({matched_params:,} params), "
+                    f"ckpt not matched {ckpt_not_matched} keys, "
+                    f"model random init {model_random_init} keys "
+                    f"(ckpt total {ckpt_total_params:,} params), weights_verified={ok}"
+                )
+                if not ok:
+                    logger.warning(
+                        "Pretrained weight verification failed: model params != ckpt for sampled keys. "
+                        "Check for device/dtype or loading path bugs."
+                    )
+            elif self._config.habitat_baselines.rl.ddppo.pretrained_encoder:
+                enc_prefix = "net.visual_encoder."
+                enc_sd = {
+                    k[len(enc_prefix) :]: v
                     for k, v in pretrained_model_state.items()
-                    if k.startswith(prefix)
+                    if k.startswith(enc_prefix)
                 }
-            )
+                load_result = actor_critic.net.visual_encoder.load_state_dict(
+                    enc_sd, strict=False
+                )
+                loaded = len(enc_sd) - len(load_result.unexpected_keys)
+                logger.info(
+                    f"Loaded pretrained encoder from {self._config.habitat_baselines.rl.ddppo.pretrained_weights}: "
+                    f"loaded {loaded}/{len(enc_sd)} keys, "
+                    f"missing {len(load_result.missing_keys)}, unexpected {len(load_result.unexpected_keys)}"
+                )
         if self._is_static_encoder and actor_critic.visual_encoder is not None:
             for param in actor_critic.visual_encoder.parameters():
                 param.requires_grad_(False)

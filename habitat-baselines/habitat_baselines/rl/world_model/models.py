@@ -154,7 +154,23 @@ class SocialNavWorldModel(nn.Module):
         # Decoders
         self.heads = nn.ModuleDict()
         
-        # Depth reconstruction decoder
+        # Depth reconstruction decoder with U-Net multi-scale skip connections
+        # skip_channels: [(ch, h, w), ...] from encoder's cached multi-scale features
+        # Order: coarse → fine = [compression(128,4,4), layer3(512,8,8),
+        #                         layer2(256,16,16), layer1(128,32,32)]
+        skip_channels = None
+        if encoder_type == 'falcon' and not self.encoder.is_blind:
+            bb = self.encoder.visual_encoder.backbone
+            bp = config.get('falcon_baseplanes', 32)
+            exp = 4  # Bottleneck expansion
+            comp_shape = self.encoder.visual_feat_2d_shape  # (128, 4, 4)
+            skip_channels = [
+                (comp_shape[0], comp_shape[1], comp_shape[2]),  # compression: 128, 4, 4
+                (bp * 4 * exp, comp_shape[1] * 2, comp_shape[2] * 2),  # layer3: 512, 8, 8
+                (bp * 2 * exp, comp_shape[1] * 4, comp_shape[2] * 4),  # layer2: 256, 16, 16
+                (bp * 1 * exp, comp_shape[1] * 8, comp_shape[2] * 8),  # layer1: 128, 32, 32
+            ]
+            logger.info(f"[World Model] Depth decoder skip channels: {skip_channels}")
         self.heads["depth"] = DepthDecoder(
             feat_size=feat_size,
             depth_shape=config.get('depth_shape', (256, 256, 1)),
@@ -164,6 +180,7 @@ class SocialNavWorldModel(nn.Module):
             kernel_size=config.get('kernel_size', 4),
             minres=config.get('minres', 4),
             outscale=config.get('decoder_outscale', 1.0),
+            skip_channels=skip_channels,
         )
         
         # Human trajectory prediction decoder（goal conditioning 使用 human_state_goal）
@@ -179,6 +196,7 @@ class SocialNavWorldModel(nn.Module):
             outscale=config.get('decoder_outscale', 1.0),
             use_goal_conditioning=config.get('use_goal_conditioning', True),
             state_goal_dim=config.get('state_goal_dim', 8),
+            residual=config.get('residual', True),
         )
         
         # Reward prediction decoder
