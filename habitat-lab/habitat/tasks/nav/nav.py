@@ -884,11 +884,25 @@ class TopDownMap(Measure):
             agent_state = self._sim.get_agent_state(agent_index)
             map_positions.append(self.update_map(agent_state, agent_index))
             map_angles.append(TopDownMap.get_polar_angle(agent_state))
+
+        lower_bound, upper_bound = self._sim.pathfinder.get_bounds()
+        robot_state = self._sim.get_agent_state(0)
+
+        goal_world_pos = None
+        if hasattr(episode, "goals") and len(episode.goals) > 0:
+            goal_world_pos = episode.goals[0].position
+
+        traj_vis_cfg = getattr(self._config, "trajectory_vis", None)
+
         self._metric = {
             "map": self._top_down_map,
             "fog_of_war_mask": self._fog_of_war_mask,
             "agent_map_coord": map_positions,
             "agent_angle": map_angles,
+            "bounds": (lower_bound, upper_bound),
+            "robot_world_pos": robot_state.position,
+            "goal_world_pos": goal_world_pos,
+            "trajectory_vis": traj_vis_cfg,
         }
 
     @staticmethod
@@ -909,20 +923,20 @@ class TopDownMap(Measure):
             (self._top_down_map.shape[0], self._top_down_map.shape[1]),
             sim=self._sim,
         )
-        if (a_x < self._top_down_map.shape[0] and a_x >= 0) and (a_y < self._top_down_map.shape[1] and a_y >= 0): # might be a typo here
+        if (a_x < self._top_down_map.shape[0] and a_x >= 0) and (a_y < self._top_down_map.shape[1] and a_y >= 0):
             pass
         else:
             return a_x, a_y
-        # Don't draw over the source point
-        # if self._top_down_map[a_x, a_y] != maps.MAP_SOURCE_POINT_INDICATOR:
-        #     color = 10 + min(
-        #         self._step_count * 245 // self._config.max_episode_steps, 245
-        #     )
+
         if self._top_down_map[a_x, a_y] != maps.MAP_SOURCE_POINT_INDICATOR:
-            color = maps.MAP_SOURCE_POINT_INDICATOR + agent_index * 10  # fit on each agent
+            color = maps.MAP_SOURCE_POINT_INDICATOR + agent_index * 10
 
             thickness = self.line_thickness
-            if self._previous_xy_location[agent_index] is not None:
+            traj_cfg = getattr(self._config, "trajectory_vis", None)
+            draw_robot = traj_cfg.draw_robot_history if traj_cfg is not None else True
+            draw_human = traj_cfg.draw_human_history if traj_cfg is not None else True
+            should_draw = (agent_index == 0 and draw_robot) or (agent_index > 0 and draw_human)
+            if should_draw and self._previous_xy_location[agent_index] is not None:
                 cv2.line(
                     self._top_down_map,
                     self._previous_xy_location[agent_index],
@@ -930,6 +944,7 @@ class TopDownMap(Measure):
                     color,
                     thickness=thickness,
                 )
+
         angle = TopDownMap.get_polar_angle(agent_state)
         self.update_fog_of_war_mask(np.array([a_x, a_y]), angle)
 

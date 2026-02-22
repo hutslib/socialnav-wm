@@ -767,9 +767,58 @@ class SoftSPLMeasurementConfig(MeasurementConfig):
 
 @dataclass
 class FogOfWarConfig:
-    draw: bool = True
+    draw: bool = False
     visibility_dist: float = 5.0
     fov: int = 90
+
+
+@dataclass
+class EvalOverlayTextConfig:
+    """Controls the metrics text bar above the unified eval frame."""
+    show: bool = True
+    font_scale: float = 0.5
+    color: List[int] = field(default_factory=lambda: [255, 255, 255])
+    bg_color: List[int] = field(default_factory=lambda: [40, 40, 40])
+    bar_height: int = 28
+    thickness: int = 1
+
+
+@dataclass
+class TrajectoryVisConfig:
+    """Controls trajectory drawing and eval frame appearance."""
+    draw_robot_history: bool = True
+    draw_human_history: bool = False
+    draw_gt_future: bool = True
+    draw_pred_future: bool = True
+    draw_human_goals: bool = False
+    draw_robot_goal: bool = True
+    gt_alpha: float = 0.35
+    pred_alpha: float = 1.0
+    gt_thickness: int = 0
+    pred_thickness: int = 0
+    robot_goal_color: List[int] = field(default_factory=lambda: [200, 0, 0])
+    gt_colors: List[List[int]] = field(default_factory=lambda: [
+        [200, 50, 0],
+        [0, 120, 80],
+        [0, 80, 200],
+        [200, 140, 0],
+        [150, 0, 200],
+        [0, 180, 180],
+        [200, 0, 100],
+        [0, 150, 100],
+    ])
+    pred_colors: List[List[int]] = field(default_factory=lambda: [
+        [255, 120, 80],
+        [100, 255, 130],
+        [60, 160, 255],
+        [255, 215, 0],
+        [220, 80, 255],
+        [80, 255, 255],
+        [255, 60, 180],
+        [80, 255, 150],
+    ])
+    depth_colormap: str = "TURBO"
+    overlay_text: EvalOverlayTextConfig = EvalOverlayTextConfig()
 
 
 @dataclass
@@ -782,12 +831,13 @@ class TopDownMapMeasurementConfig(MeasurementConfig):
     map_resolution: int = 1024
     draw_source: bool = True
     draw_border: bool = True
-    draw_shortest_path: bool = True
+    draw_shortest_path: bool = False
     draw_view_points: bool = True
     draw_goal_positions: bool = True
     # axes aligned bounding boxes
     draw_goal_aabbs: bool = True
     fog_of_war: FogOfWarConfig = FogOfWarConfig()
+    trajectory_vis: TrajectoryVisConfig = TrajectoryVisConfig()
 
 
 @dataclass

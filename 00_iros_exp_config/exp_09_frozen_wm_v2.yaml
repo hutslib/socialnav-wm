@@ -1,0 +1,16 @@
+# @package _global_
+# 实验 9: Frozen WM (冻结 World Model，仅使用预训练权重作为特征提取器)
+# 目的: 验证不继续训练 WM、只用预训练 WM 特征是否足够
+
+defaults:
+  - exp_02_full_wm_v2
+  - _self_
+
+habitat_baselines:
+  tensorboard_dir: "experiments/exp_09_frozen_wm_v2/tb"
+  video_dir: "experiments/exp_09_frozen_wm_v2/video"
+  checkpoint_folder: "experiments/exp_09_frozen_wm_v2/checkpoints"
+
+  world_model:
+    train_world_model: False
+    pretrained_wm_checkpoint: "experiments/exp_02_full_wm_v2/checkpoints/latest.pth"

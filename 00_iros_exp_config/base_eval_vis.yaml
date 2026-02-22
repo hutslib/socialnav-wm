@@ -1,0 +1,91 @@
+# @package _global_
+# ============================================================================
+# Base Eval Visualization Config — 所有可选的评估绘图参数
+# ============================================================================
+# 用法: 在实验的 eval yaml 的 defaults 中引用此文件，然后按需覆盖。
+#
+# defaults:
+#   - base_eval_vis
+#   - _self_
+#
+# 之后可以在实验 yaml 中覆盖任意参数，例如:
+#   habitat.task.measurements.top_down_map.trajectory_vis.gt_alpha: 0.5
+# ============================================================================
+
+habitat:
+  task:
+    measurements:
+      top_down_map:
+        # ── 基础地图绘制 ──
+        map_resolution: 1024
+        map_padding: 3
+        draw_source: true           # 绘制起点
+        draw_border: true           # 绘制地图边框
+        draw_shortest_path: false   # 最短路径参考线
+        draw_view_points: true      # 目标可视区域
+        draw_goal_positions: true   # 原生目标点（小红点）
+        draw_goal_aabbs: true       # 目标 AABB 框
+
+        # ── 迷雾 (Fog of War) ──
+        fog_of_war:
+          draw: false               # 是否启用迷雾
+          visibility_dist: 5.0      # 可见距离 (米)
+          fov: 90                   # 视野角度 (度)
+
+        # ── 轨迹可视化 (trajectory_vis) ──
+        trajectory_vis:
+          # ---- 是否绘制 ----
+          draw_robot_history: true    # 机器人历史轨迹 (地图原生)
+          draw_human_history: false   # 人历史轨迹 (地图原生)
+          draw_gt_future: true        # GT 未来轨迹 (WM overlay)
+          draw_pred_future: true      # 预测未来轨迹 (WM overlay)
+          draw_human_goals: false     # 人目标点
+          draw_robot_goal: true       # 机器人目标点 (pin marker)
+
+          # ---- 透明度 (0.0=全透明, 1.0=不透明) ----
+          gt_alpha: 0.35              # GT 未来轨迹透明度
+          pred_alpha: 1.0             # 预测未来轨迹透明度
+
+          # ---- 线宽 (0=根据地图大小自适应, >0=固定像素) ----
+          gt_thickness: 0
+          pred_thickness: 0
+
+          # ---- 机器人目标颜色 (RGB) ----
+          robot_goal_color: [200, 0, 0]
+
+          # ---- 每个人的 GT 轨迹颜色 (RGB, 按人编号 H1-H8) ----
+          gt_colors:
+            - [200, 50, 0]       # H1: dark red
+            - [0, 120, 80]       # H2: dark green
+            - [0, 80, 200]       # H3: dark blue
+            - [200, 140, 0]      # H4: dark orange
+            - [150, 0, 200]      # H5: dark magenta
+            - [0, 180, 180]      # H6: dark cyan
+            - [200, 0, 100]      # H7: red-violet
+            - [0, 150, 100]      # H8: teal
+
+          # ---- 每个人的预测轨迹颜色 (RGB, 按人编号 H1-H8) ----
+          pred_colors:
+            - [255, 120, 80]     # H1: bright red-orange
+            - [100, 255, 130]    # H2: bright green
+            - [60, 160, 255]     # H3: bright blue
+            - [255, 215, 0]      # H4: bright gold
+            - [220, 80, 255]     # H5: bright magenta
+            - [80, 255, 255]     # H6: bright cyan
+            - [255, 60, 180]     # H7: bright pink
+            - [80, 255, 150]     # H8: bright teal
+
+          # ---- Depth Colormap ----
+          # 可选: AUTUMN, BONE, JET, WINTER, RAINBOW, OCEAN, SUMMER, SPRING,
+          #       COOL, HSV, PINK, HOT, PARULA, MAGMA, INFERNO, PLASMA,
+          #       VIRIDIS, CIVIDIS, TWILIGHT, TWILIGHT_SHIFTED, TURBO, DEEPGREEN
+          depth_colormap: TURBO
+
+          # ---- 顶部指标文字条 (不遮挡图片，在图片上方) ----
+          overlay_text:
+            show: true              # 是否显示指标条
+            font_scale: 0.5         # 字体大小 (OpenCV scale)
+            color: [255, 255, 255]  # 字体颜色 (RGB)
+            bg_color: [40, 40, 40]  # 指标条背景色 (RGB)
+            bar_height: 28          # 指标条高度 (像素)
+            thickness: 1            # 字体粗细 (像素)

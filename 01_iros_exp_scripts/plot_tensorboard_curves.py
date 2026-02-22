@@ -3,10 +3,10 @@
 从 TensorBoard 日志绘制多实验对比曲线：reward / SPL / Success vs step。
 
 用法:
-  # 绘制 experiments/ 下所有 exp_* 的 tb 目录
+  # 绘制代码中 EXPERIMENT_FOLDERS 列表里的实验（默认）
   python 01_iros_exp_scripts/plot_tensorboard_curves.py
 
-  # 指定实验目录或名称
+  # 指定实验目录或名称（覆盖列表）
   python 01_iros_exp_scripts/plot_tensorboard_curves.py --experiments exp_01_baseline_falcon exp_02_full_wm
 
   # 指定 experiments 根目录
@@ -18,6 +18,20 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+
+# 需要画曲线的实验文件夹（相对 --root 的子目录名），不指定 --experiments 时使用此列表
+EXPERIMENT_FOLDERS: list[str] = [
+    "exp_01_baseline_no_aux",
+    # "exp_02_full_wm",
+    "exp_02_full_wm_v2",
+    "exp_02_full_wm_v2_no_aux",
+    "exp_05_pretrain_ratio_025",
+    "exp_07_pretrain_ratio_001",
+    # "exp_09_baseline_aux",
+    # "exp_09_frozen_wm",
+    "exp_09_frozen_wm_v2",
+    # 按需增删
+]
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -148,6 +162,26 @@ def smooth(y: list[float], weight: float = 0.9) -> np.ndarray:
     return np.array(out)
 
 
+def clip_data_by_max_step(
+    data_by_exp: dict[str, dict], max_step: int
+) -> dict[str, dict]:
+    """只保留 step <= max_step 的数据点。"""
+    out = {}
+    for exp_name, scalars in data_by_exp.items():
+        out[exp_name] = {}
+        for tag, (steps, values) in scalars.items():
+            if not steps:
+                out[exp_name][tag] = ([], [])
+                continue
+            steps, values = np.array(steps), np.array(values)
+            mask = steps <= max_step
+            out[exp_name][tag] = (
+                steps[mask].tolist(),
+                values[mask].tolist(),
+            )
+    return out
+
+
 def plot_curves(
     data_by_exp: dict[str, dict],
     tag: str,
@@ -155,6 +189,7 @@ def plot_curves(
     title: str,
     out_path: str | Path,
     smooth_weight: float = 0.0,
+    max_step: int | None = None,
 ):
     """画单张图：多实验同一 tag 的曲线。"""
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
@@ -172,6 +207,8 @@ def plot_curves(
     ax.set_xlabel("Step")
     ax.set_ylabel(ylabel)
     ax.set_title(title)
+    if max_step is not None and max_step > 0:
+        ax.set_xlim(0, max_step)
     if ax.get_legend_handles_labels()[0]:
         ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
@@ -184,6 +221,7 @@ def plot_curves(
 def plot_spl_success_compare(
     data_by_exp: dict[str, dict],
     out_path: str | Path,
+    max_step: int | None = None,
 ):
     """一张图内两个子图：SPL vs step 与 Success vs step 对比。"""
     fig, (ax_spl, ax_sr) = plt.subplots(2, 1, figsize=(8, 8), sharex=True)
@@ -200,6 +238,8 @@ def plot_spl_success_compare(
             steps = np.array(steps)
             values = np.array(values)
             ax.plot(steps, values, label=exp_name, alpha=0.85)
+    if max_step is not None and max_step > 0:
+        ax_spl.set_xlim(0, max_step)
     ax_spl.set_ylabel("SPL")
     ax_spl.set_title("Eval SPL vs Step")
     if ax_spl.get_legend_handles_labels()[0]:
@@ -245,6 +285,12 @@ def main():
         default=0.0,
         help="reward 曲线平滑系数 (0~1)，0 表示不平滑。建议 0.6~0.9",
     )
+    parser.add_argument(
+        "--max-step",
+        type=int,
+        default=0,
+        help="只绘制到该 step（0 表示不限制）。例如 --max-step 2000000",
+    )
     args = parser.parse_args()
 
     root = Path(args.root)
@@ -252,22 +298,24 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 每个实验可能对应多个 tb 目录（断点续训），收集 (exp_name, list of tb dirs)
+    # 优先用命令行 --experiments，否则用代码中的 EXPERIMENT_FOLDERS
     if args.experiments:
         exp_names = list(args.experiments)
-        exp_to_tb_dirs = []
-        for name in exp_names:
-            exp_dir = root / name
-            dirs = find_all_tb_dirs_under(exp_dir)
-            if not dirs:
-                dirs = [exp_dir / "tb"] if (exp_dir / "tb").exists() else []
-            exp_to_tb_dirs.append((name, dirs))
     else:
-        exp_to_tb_dirs = []
-        for d in sorted(root.iterdir()):
-            if d.is_dir() and d.name.startswith("exp_"):
-                dirs = find_all_tb_dirs_under(d)
-                if dirs:
-                    exp_to_tb_dirs.append((d.name, dirs))
+        exp_names = list(EXPERIMENT_FOLDERS)
+    exp_to_tb_dirs = []
+    for name in exp_names:
+        exp_dir = root / name
+        if not exp_dir.is_dir():
+            print(f"跳过不存在的目录: {exp_dir}")
+            continue
+        dirs = find_all_tb_dirs_under(exp_dir)
+        if not dirs:
+            dirs = [exp_dir / "tb"] if (exp_dir / "tb").exists() else []
+        if dirs:
+            exp_to_tb_dirs.append((name, dirs))
+        else:
+            print(f"跳过（无 tb 目录）: {name}")
 
     if not exp_to_tb_dirs:
         print("未找到任何实验的 TensorBoard 目录。")
@@ -295,6 +343,11 @@ def main():
     for name, tb_dir_list in exp_to_tb_dirs:
         data_by_exp[name] = load_tb_scalars_merged(tb_dir_list, all_tags)
 
+    max_step = args.max_step if args.max_step > 0 else None
+    if max_step is not None:
+        data_by_exp = clip_data_by_max_step(data_by_exp, max_step)
+        print(f"只绘制 step <= {max_step} 的数据")
+
     # Reward vs step（训练曲线，可平滑）
     plot_curves(
         data_by_exp,
@@ -303,6 +356,7 @@ def main():
         title="Training Reward vs Step",
         out_path=out_dir / "reward_vs_step.png",
         smooth_weight=args.smooth,
+        max_step=max_step,
     )
 
     # SPL vs step（评估曲线）
@@ -313,6 +367,7 @@ def main():
         title="Eval SPL vs Step",
         out_path=out_dir / "spl_vs_step.png",
         smooth_weight=0.0,
+        max_step=max_step,
     )
 
     # Success Rate vs step（评估曲线）
@@ -323,12 +378,14 @@ def main():
         title="Eval Success Rate vs Step",
         out_path=out_dir / "success_vs_step.png",
         smooth_weight=0.0,
+        max_step=max_step,
     )
 
     # SPL 与 Success 对比（一张图两子图）
     plot_spl_success_compare(
         data_by_exp,
         out_path=out_dir / "spl_success_vs_step.png",
+        max_step=max_step,
     )
 
     # 可选：评估阶段 average reward
@@ -339,6 +396,7 @@ def main():
         title="Eval Average Reward vs Step",
         out_path=out_dir / "eval_reward_vs_step.png",
         smooth_weight=0.0,
+        max_step=max_step,
     )
 
 

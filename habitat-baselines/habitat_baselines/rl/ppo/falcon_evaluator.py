@@ -2,6 +2,7 @@ import os
 from collections import defaultdict
 from typing import Any, Dict, List
 
+import cv2
 import numpy as np
 import torch
 import tqdm
@@ -13,6 +14,7 @@ from habitat.utils.visualizations.utils import (
     observations_to_image,
     overlay_frame,
 )
+from habitat.utils.visualizations import maps
 from habitat_baselines.common.obs_transformers import (
     apply_obs_transforms_batch,
 )
@@ -25,7 +27,12 @@ from habitat_baselines.utils.common import (
     is_continuous_action_space,
 )
 from habitat_baselines.utils.info_dict import extract_scalars_from_info
-from habitat_baselines.utils.wm_visualizer import WMVisualizer
+from habitat_baselines.utils.wm_visualizer import (
+    WMVisualizer,
+    WMStepResult,
+    compose_unified_frame,
+    _depth_obs_to_vis,
+)
 
 import json
 
@@ -88,24 +95,7 @@ class FALCONEvaluator(Evaluator):
         ] = {}  # dict of dicts that stores stats per episode
         ep_eval_count: Dict[Any, int] = defaultdict(lambda: 0)
 
-        if len(config.habitat_baselines.eval.video_option) > 0:
-            # Add the first frame of the episode to the video.
-            rgb_frames: List[List[np.ndarray]] = [
-                [
-                    observations_to_image(
-                        {k: v[env_idx] for k, v in batch.items()}, {}
-                    )
-                ]
-                for env_idx in range(config.habitat_baselines.num_environments)
-            ]
-        else:
-            rgb_frames = None
-
         # ── World Model visualisation ──
-        # Locate the world_model from the policy network.
-        # In multi-agent setup: agent._agents[0]._actor_critic.net.world_model
-        # In single-agent:      agent.actor_critic.net.world_model
-        # MultiPolicy wrapper:  agent.actor_critic._active_policies[0].net.world_model
         wm_obj = None
         for candidate in [
             getattr(agent, "actor_critic", None),
@@ -117,18 +107,31 @@ class FALCONEvaluator(Evaluator):
             if _net is not None and hasattr(_net, "world_model") and _net.world_model is not None:
                 wm_obj = _net.world_model
                 break
-        has_wm = wm_obj is not None and len(config.habitat_baselines.eval.video_option) > 0
+        save_images = getattr(config.habitat_baselines.eval, "save_images", False)
+        collect_frames = len(config.habitat_baselines.eval.video_option) > 0 or save_images
+        has_wm = wm_obj is not None and collect_frames
         if has_wm:
             wm_vis = WMVisualizer(wm_obj, device, config.habitat_baselines.num_environments)
-            wm_frames: List[List[np.ndarray]] = [
-                [] for _ in range(config.habitat_baselines.num_environments)
-            ]
         else:
             wm_vis = None
-            wm_frames = None
+
+        if collect_frames:
+            rgb_frames: List[List[np.ndarray]] = [
+                [
+                    observations_to_image(
+                        {k: v[env_idx] for k, v in batch.items()}, {}
+                    )
+                ]
+                for env_idx in range(config.habitat_baselines.num_environments)
+            ]
+        else:
+            rgb_frames = None
 
         if len(config.habitat_baselines.eval.video_option) > 0:
             os.makedirs(config.habitat_baselines.video_dir, exist_ok=True)
+        if save_images:
+            image_dir = getattr(config.habitat_baselines.eval, "image_dir", None) or os.path.join(config.habitat_baselines.video_dir, "images")
+            os.makedirs(image_dir, exist_ok=True)
 
         number_of_eval_episodes = config.habitat_baselines.test_episode_count
         evals_per_ep = config.habitat_baselines.eval.evals_per_ep
@@ -248,12 +251,11 @@ class FALCONEvaluator(Evaluator):
             )
             batch = apply_obs_transforms_batch(batch, obs_transforms)  # type: ignore
 
-            # ── Collect WM visualisation frames ──
+            # ── Collect WM results per env ──
+            wm_results = {}
             if wm_vis is not None:
                 for i in range(envs.num_envs):
-                    wm_frame = wm_vis.step(batch, prev_actions, not_done_masks, i)
-                    if wm_frame is not None:
-                        wm_frames[i].append(wm_frame)
+                    wm_results[i] = wm_vis.step(batch, prev_actions, not_done_masks, i)
 
             not_done_masks = torch.tensor(
                 [[not done] for done in dones],
@@ -280,30 +282,106 @@ class FALCONEvaluator(Evaluator):
                 ):
                     envs_to_pause.append(i)
 
-                # Exclude the keys from `_rank0_keys` from displaying in the video
                 disp_info = {
                     k: v for k, v in infos[i].items() if k not in rank0_keys
                 }
 
-                if len(config.habitat_baselines.eval.video_option) > 0:
-                    # TODO move normalization / channel changing out of the policy and undo it here
-                    frame = observations_to_image(
-                        {k: v[i] for k, v in batch.items()}, disp_info
-                    )
-                    if not not_done_masks[i].any().item():
-                        # The last frame corresponds to the first frame of the next episode
-                        # but the info is correct. So we use a black frame
-                        final_frame = observations_to_image(
-                            {k: v[i] * 0.0 for k, v in batch.items()},
-                            disp_info,
+                if collect_frames:
+                    wm_res_i = wm_results.get(i, None)
+
+                    if wm_vis is not None:
+                        # ── Unified layout: [RGB | GT Depth | Pred Depth | TopDown+Traj] ──
+                        obs_i = {k: v[i] for k, v in batch.items()}
+                        rgb_key = next(
+                            (k for k in obs_i if "rgb" in k.lower() and len(obs_i[k].shape) > 1), None
                         )
-                        final_frame = overlay_frame(final_frame, disp_info)
-                        rgb_frames[i].append(final_frame)
-                        # The starting frame of the next episode will be the final element..
-                        rgb_frames[i].append(frame)
+                        depth_key = next(
+                            (k for k in obs_i if "depth" in k.lower() and len(obs_i[k].shape) > 1), None
+                        )
+
+                        rgb_obs = obs_i[rgb_key] if rgb_key else None
+                        gt_depth_obs = obs_i[depth_key] if depth_key else None
+
+                        if rgb_obs is not None:
+                            if not isinstance(rgb_obs, np.ndarray):
+                                rgb_obs = rgb_obs.cpu().numpy()
+                            if rgb_obs.dtype != np.uint8:
+                                rgb_obs = (rgb_obs * 255.0).astype(np.uint8)
+
+                        if gt_depth_obs is not None:
+                            if not isinstance(gt_depth_obs, np.ndarray):
+                                gt_depth_obs = gt_depth_obs.cpu().numpy()
+
+                        topdown_map = None
+                        robot_world_pos = None
+                        goal_world_pos = None
+                        td_bounds = None
+                        raw_map_shape = None
+                        traj_vis_cfg = None
+                        if "top_down_map" in disp_info:
+                            td_info = disp_info["top_down_map"]
+                            raw_map_shape = td_info["map"].shape[:2]
+                            topdown_map = maps.colorize_draw_agent_and_fit_to_height(
+                                td_info, rgb_obs.shape[0] if rgb_obs is not None else 256
+                            )
+                            td_bounds = td_info.get("bounds", None)
+                            rwp = td_info.get("robot_world_pos", None)
+                            if rwp is not None:
+                                robot_world_pos = np.asarray(rwp, dtype=np.float64)
+                            gwp = td_info.get("goal_world_pos", None)
+                            if gwp is not None:
+                                goal_world_pos = np.asarray(gwp, dtype=np.float64)
+                            traj_vis_cfg = td_info.get("trajectory_vis", None)
+
+                        pred_depth_vis = wm_res_i.pred_depth_vis if wm_res_i else None
+                        depth_rmse = wm_res_i.depth_rmse if wm_res_i else 0.0
+
+                        compose_kwargs = dict(
+                            wm_result=wm_res_i, depth_rmse=depth_rmse,
+                            robot_world_pos=robot_world_pos,
+                            goal_world_pos=goal_world_pos,
+                            bounds=td_bounds, raw_map_shape=raw_map_shape,
+                            traj_cfg=traj_vis_cfg,
+                        )
+
+                        if not not_done_masks[i].any().item():
+                            black_rgb = np.zeros_like(rgb_obs) if rgb_obs is not None else None
+                            black_depth = np.zeros_like(gt_depth_obs) if gt_depth_obs is not None else None
+                            final_frame = compose_unified_frame(
+                                black_rgb, black_depth, pred_depth_vis, topdown_map,
+                                **compose_kwargs,
+                            )
+                            final_frame = overlay_frame(final_frame, disp_info)
+                            rgb_frames[i].append(final_frame)
+
+                            frame = compose_unified_frame(
+                                rgb_obs, gt_depth_obs, pred_depth_vis, topdown_map,
+                                **compose_kwargs,
+                            )
+                            rgb_frames[i].append(frame)
+                        else:
+                            frame = compose_unified_frame(
+                                rgb_obs, gt_depth_obs, pred_depth_vis, topdown_map,
+                                **compose_kwargs,
+                            )
+                            frame = overlay_frame(frame, disp_info)
+                            rgb_frames[i].append(frame)
                     else:
-                        frame = overlay_frame(frame, disp_info)
-                        rgb_frames[i].append(frame)
+                        # ── Fallback: original layout (no WM) ──
+                        frame = observations_to_image(
+                            {k: v[i] for k, v in batch.items()}, disp_info
+                        )
+                        if not not_done_masks[i].any().item():
+                            final_frame = observations_to_image(
+                                {k: v[i] * 0.0 for k, v in batch.items()},
+                                disp_info,
+                            )
+                            final_frame = overlay_frame(final_frame, disp_info)
+                            rgb_frames[i].append(final_frame)
+                            rgb_frames[i].append(frame)
+                        else:
+                            frame = overlay_frame(frame, disp_info)
+                            rgb_frames[i].append(frame)
 
                 # episode ended
                 if not not_done_masks[i].any().item():
@@ -321,18 +399,15 @@ class FALCONEvaluator(Evaluator):
                         current_episodes_info[i].episode_id,
                     )
                     ep_eval_count[k] += 1
-                    # use scene_id + episode_id as unique id for storing stats
                     stats_episodes[(k, ep_eval_count[k])] = episode_stats
 
                     if len(config.habitat_baselines.eval.video_option) > 0:
-                        # show scene and episode
                         scene_id = current_episodes_info[i].scene_id.split('/')[-1].split('.')[0]
-                        print(f"This is Scene ID: {scene_id}, Episode ID: {current_episodes_info[i].episode_id}.") # for debug
+                        print(f"This is Scene ID: {scene_id}, Episode ID: {current_episodes_info[i].episode_id}.")
                         
                         generate_video(
                             video_option=config.habitat_baselines.eval.video_option,
                             video_dir=config.habitat_baselines.video_dir,
-                            # Since the final frame is the start frame of the next episode.
                             images=rgb_frames[i][:-1],
                             scene_id=f"{current_episodes_info[i].scene_id}".split('/')[-1].split('.')[0],
                             episode_id=f"{current_episodes_info[i].episode_id}_{ep_eval_count[k]}",
@@ -343,24 +418,25 @@ class FALCONEvaluator(Evaluator):
                             keys_to_include_in_name=config.habitat_baselines.eval_keys_to_include_in_name,
                         )
 
-                        # ── Save WM visualisation video ──
-                        if wm_vis is not None and len(wm_frames[i]) > 0:
-                            generate_video(
-                                video_option=config.habitat_baselines.eval.video_option,
-                                video_dir=config.habitat_baselines.video_dir,
-                                images=wm_frames[i],
-                                scene_id=f"{current_episodes_info[i].scene_id}".split('/')[-1].split('.')[0],
-                                episode_id=f"{current_episodes_info[i].episode_id}_{ep_eval_count[k]}_wm",
-                                checkpoint_idx=checkpoint_index,
-                                metrics=extract_scalars_from_info(disp_info),
-                                fps=config.habitat_baselines.video_fps,
-                                tb_writer=writer,
-                                keys_to_include_in_name=config.habitat_baselines.eval_keys_to_include_in_name,
-                            )
-                            wm_frames[i] = []
+                        if wm_vis is not None:
                             wm_vis.reset_env(i)
 
-                        # Since the starting frame of the next episode is the final frame.
+                    if save_images and rgb_frames is not None:
+                        scene_id = current_episodes_info[i].scene_id.split('/')[-1].split('.')[0]
+                        ep_id = f"{current_episodes_info[i].episode_id}_{ep_eval_count[k]}"
+                        image_dir = getattr(config.habitat_baselines.eval, "image_dir", None)
+                        if image_dir is None or image_dir == "":
+                            image_dir = os.path.join(config.habitat_baselines.video_dir, "images")
+                        out_dir = os.path.join(image_dir, scene_id, ep_id)
+                        os.makedirs(out_dir, exist_ok=True)
+                        frames_to_save = rgb_frames[i][:-1]
+                        for t, frame in enumerate(frames_to_save):
+                            path = os.path.join(out_dir, f"frame_{t:06d}.png")
+                            if frame.ndim == 3 and frame.shape[2] == 3:
+                                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            cv2.imwrite(path, frame)
+
+                    if collect_frames:
                         rgb_frames[i] = rgb_frames[i][-1:]
 
                     gfx_str = infos[i].get(GfxReplayMeasure.cls_uuid, "")
@@ -390,13 +466,6 @@ class FALCONEvaluator(Evaluator):
                 batch,
                 rgb_frames,
             )
-
-            # Pause wm_frames in sync with rgb_frames
-            if wm_frames is not None and len(envs_to_pause) > 0:
-                state_index = list(range(envs.num_envs + len(envs_to_pause)))
-                for idx in reversed(envs_to_pause):
-                    state_index.pop(idx)
-                wm_frames = [wm_frames[i] for i in state_index]
 
             # We pause the statefull parameters in the policy.
             # We only do this if there are envs to pause to reduce the overhead.

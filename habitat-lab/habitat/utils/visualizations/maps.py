@@ -124,28 +124,36 @@ MAP_HUMAN_8_FUTURE_GOAL_4 = 98
 MAP_HUMAN_8_FUTURE_GOAL = 99
 MAP_HUMAN_8_FUTURE_TRAJECTORY = 100
 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_1] = [230, 230, 250] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_2] = [216, 191, 216] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_3] = [186, 85, 211] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_4] = [148, 0, 211] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL] = [138, 43, 226] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_TRAJECTORY] = [128, 0, 128] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_TRAJECTORY] = [255, 48, 48] # firebrick1 (red)
-
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_1] = [255, 255, 191] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_2] = [255, 255, 0] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_3] = [255, 215, 0] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_4] = [255, 193, 37] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL] = [255, 165, 0] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_TRAJECTORY] = [255, 140, 0] # 
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_TRAJECTORY] = [255,182,193] # lightpink
-
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_3_TRAJECTORY] = [0,255,255] # green -》 Cyan
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_4_TRAJECTORY] = [255,165,0] # orange
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_5_TRAJECTORY] = [160,32,240] # purple
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_6_TRAJECTORY] = [255,255,0] # yellow
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_7_TRAJECTORY] = [165,42,42] # indigo
-TOP_DOWN_MAP_COLORS[MAP_HUMAN_8_TRAJECTORY] = [255,182,193] # brown
+# Unified color scheme (RGB) — history trajectories use the same base hue
+# as the GT future trajectories in wm_visualizer.py (which uses BGR).
+# Human 1: red family
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_TRAJECTORY] = [200, 50, 0]       # dark red
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_1] = [230, 230, 250]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_2] = [216, 191, 216]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_3] = [186, 85, 211]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL_4] = [148, 0, 211]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_GOAL] = [138, 43, 226]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_1_FUTURE_TRAJECTORY] = [128, 0, 128]
+# Human 2: green family
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_TRAJECTORY] = [0, 120, 80]       # dark green
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_1] = [255, 255, 191]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_2] = [255, 255, 0]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_3] = [255, 215, 0]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL_4] = [255, 193, 37]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_GOAL] = [255, 165, 0]
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_2_FUTURE_TRAJECTORY] = [255, 140, 0]
+# Human 3: blue family
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_3_TRAJECTORY] = [0, 80, 200]       # dark blue
+# Human 4: orange family
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_4_TRAJECTORY] = [200, 140, 0]      # dark orange
+# Human 5: magenta family
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_5_TRAJECTORY] = [150, 0, 200]      # dark magenta
+# Human 6: cyan family
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_6_TRAJECTORY] = [0, 180, 180]      # dark cyan
+# Human 7: deep red-violet
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_7_TRAJECTORY] = [200, 0, 100]
+# Human 8: teal
+TOP_DOWN_MAP_COLORS[MAP_HUMAN_8_TRAJECTORY] = [0, 150, 100]
 
 # def draw_agent(
 #     image: np.ndarray,
@@ -182,6 +190,48 @@ TOP_DOWN_MAP_COLORS[MAP_HUMAN_8_TRAJECTORY] = [255,182,193] # brown
 #     utils.paste_overlapping_image(image, resized_agent, agent_center_coord)
 #     return image
 
+# RGB colors for human agent sprites, indexed by (agent_idx - 1).
+# Must match TOP_DOWN_MAP_COLORS[MAP_HUMAN_*_TRAJECTORY] above.
+_HUMAN_SPRITE_COLORS_RGB = [
+    (200, 50, 0),     # H1: dark red
+    (0, 120, 80),     # H2: dark green
+    (0, 80, 200),     # H3: dark blue
+    (200, 140, 0),    # H4: dark orange
+    (150, 0, 200),    # H5: dark magenta
+    (0, 180, 180),    # H6: dark cyan
+    (200, 0, 100),    # H7: red-violet
+    (0, 150, 100),    # H8: teal
+]
+
+
+def _recolor_sprite_ring(sprite: np.ndarray, target_rgb: Tuple[int, int, int]) -> np.ndarray:
+    """Replace the coloured ring in a human sprite with *target_rgb*.
+
+    The ring is detected as non-white, non-black, non-transparent pixels.
+    """
+    out = sprite.copy()
+    has_alpha = out.shape[2] == 4
+    rgb = out[:, :, :3].astype(np.float32)
+
+    if has_alpha:
+        visible = out[:, :, 3] > 128
+    else:
+        visible = np.ones(rgb.shape[:2], dtype=bool)
+
+    is_white = (rgb[:, :, 0] > 200) & (rgb[:, :, 1] > 200) & (rgb[:, :, 2] > 200)
+    is_black = (rgb[:, :, 0] < 60) & (rgb[:, :, 1] < 60) & (rgb[:, :, 2] < 60)
+    ring_mask = visible & ~is_white & ~is_black
+
+    if not ring_mask.any():
+        return out
+
+    src = rgb[ring_mask]
+    brightness = src.max(axis=1, keepdims=True) / 255.0
+    tgt = np.array(target_rgb, dtype=np.float32).reshape(1, 3)
+    out[:, :, :3][ring_mask] = np.clip(tgt * brightness, 0, 255).astype(np.uint8)
+    return out
+
+
 def draw_agent(
     image: np.ndarray,
     agent_center_coord: Tuple[int, int],
@@ -199,7 +249,6 @@ def draw_agent(
     Returns:
         The modified background image. This operation is in place.
     """
-    # spot_agent
     if agent_idx == 0:
         AGENT_SPRITE = imageio.imread(
             os.path.join(
@@ -222,6 +271,8 @@ def draw_agent(
         
         AGENT_SPRITE = imageio.imread(file_path)
         AGENT_SPRITE = np.ascontiguousarray(np.flipud(AGENT_SPRITE))
+        target_color = _HUMAN_SPRITE_COLORS_RGB[agent_idx - 1]
+        AGENT_SPRITE = _recolor_sprite_ring(AGENT_SPRITE, target_color)
         
     else:
         raise ValueError("agent_idx should be between 0 and 8")

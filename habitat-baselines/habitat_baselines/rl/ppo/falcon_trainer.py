@@ -572,6 +572,8 @@ class FalconTrainer(BaseRLTrainer):
         self.replay_buffer_num_envs = None
         self.replay_buffer_env_capacity = None
         self.replay_buffer_warmup = getattr(wm_config, "replay_buffer_warmup", 5000)
+        # 每多少次 PPO update 保存一次 WM 可视化到磁盘/TensorBoard（默认 1000，0 表示不保存）
+        self.wm_vis_interval = getattr(wm_config, "wm_vis_interval", 20)
 
         logger.info(f"World Model training initialized:")
         logger.info(f"  - wm_train_ratio: {self.wm_train_ratio} (update every {int(1/self.wm_train_ratio)} policy updates)")
@@ -579,6 +581,7 @@ class FalconTrainer(BaseRLTrainer):
         logger.info("  - wm_mode: decoupled (independent optimizer)")
         logger.info(f"  - freeze_wm_encoder: {self.freeze_wm_encoder}")
         logger.info(f"  - replay_buffer_size: {buffer_size}")
+        logger.info(f"  - wm_vis_interval: {self.wm_vis_interval} (0=disable)")
         logger.info(f"  - wm_batch_size: {self.wm_batch_size}")
         logger.info(f"  - wm_sequence_length: {self.wm_sequence_length}")
         logger.info(f"  - wm_ddp: {self.wm_ddp_enabled}")
@@ -1878,8 +1881,12 @@ class FalconTrainer(BaseRLTrainer):
                     # 添加 WM losses 到总 losses
                     for key, value in wm_losses.items():
                         losses[f'wm_{key}'] = value
-                    # 每 10000 次 update 才存储 WM 可视化到磁盘并写 TensorBoard
-                    if rank0_only() and (self.num_updates_done % 10000 == 0):
+                    # 按 wm_vis_interval 存储 WM 可视化到磁盘并写 TensorBoard（wm_vis_interval=0 则不保存）
+                    if (
+                        self.wm_vis_interval > 0
+                        and rank0_only()
+                        and (self.num_updates_done % self.wm_vis_interval == 0)
+                    ):
                         self._visualize_wm_predictions(
                             writer, self.num_steps_done, num_samples=3
                         )
@@ -2013,7 +2020,7 @@ class FalconTrainer(BaseRLTrainer):
         evaluator.evaluate_agent(
             self._agent,
             self.envs,
-            self.config,
+            config,
             checkpoint_index,
             step_id,
             writer,

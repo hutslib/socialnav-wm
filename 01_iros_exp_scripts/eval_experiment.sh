@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 评估实验
-# 使用方法: ./eval_experiment.sh <experiment> [checkpoint_step]
+# 使用方法: ./eval_experiment.sh <experiment> [checkpoint_step] [num_environments]
 # 支持输入:
 #   1) 01_baseline_falcon
 #   2) exp_01_baseline_falcon
@@ -22,6 +22,7 @@ fi
 
 EXP_INPUT=$1
 CKPT_STEP=${2:-"latest"}
+NUM_ENVS=${3:-4}
 
 # 配置环境变量
 export PYTHONPATH=$(pwd):$PYTHONPATH
@@ -72,15 +73,17 @@ fi
 
 echo "评估实验: ${EXP_NAME}"
 echo "使用checkpoint: ${CKPT_PATH}"
+echo "并行环境数: ${NUM_ENVS}"
 
 python -u -m habitat_baselines.run \
     --config-name="${CONFIG_NAME}" \
     habitat_baselines.evaluate=True \
+    habitat_baselines.load_resume_state_config=False \
     habitat_baselines.eval_ckpt_path_dir=${CKPT_PATH} \
     habitat_baselines.eval.should_load_ckpt=True \
     "habitat_baselines.eval.video_option=[disk]" \
     habitat_baselines.video_dir="eval_experiments/${EXP_NAME_BASE}/video" \
-    habitat_baselines.num_environments=1 \
+    habitat_baselines.num_environments=${NUM_ENVS} \
     habitat_baselines.test_episode_count=50
 
 echo "评估完成: ${EXP_NAME}"
